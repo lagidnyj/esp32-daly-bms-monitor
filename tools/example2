@@ -1,0 +1,419 @@
+#define CONFIG_NIMBLE_CPP_LOG_LEVEL 4
+
+// Daly Smart BMS (BLE) -> ESP32, NimBLE-Arduino 2.3.x
+// Sequential polling: connect -> read -> disconnect, one BMS at a time.
+// Output: verbose log + JSON line per cycle (for a future web UI).
+// Serial commands: 's' = rescan, 'p' = poll now.
+//
+// Arduino IDE: rename this file to daly_ble.ino
+
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <vector>
+#include <string>
+
+// ================= CONFIG =================
+// Leave empty to auto-pick devices (name starts with NAME_PREFIX or advertises FFF0).
+// Or list MACs after replacing the placeholder with your device address.
+static const char* const BMS_MACS[] = {
+  // "YOUR_BMS_MAC",
+  nullptr
+};
+#define NAME_PREFIX       "JHB-"
+#define SCAN_MS           8000     // 2.x: milliseconds
+#define CONNECT_MS        10000    // 2.x: milliseconds
+#define POLL_INTERVAL_MS  10000
+#define MAX_BMS           8
+#define CONN_MIN          24       // 30 ms (units 1.25 ms)
+#define CONN_MAX          40       // 50 ms
+#define VERBOSE           1        // 1 = print raw frames
+
+static const char* SVC_UUID = "0000fff0-0000-1000-8000-00805f9b34fb";
+static const char* NTF_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"; // BMS -> ESP (notify)
+static const char* WR_UUID  = "0000fff2-0000-1000-8000-00805f9b34fb"; // ESP -> BMS (write)
+
+// ================= TYPES =================
+struct Found {
+  NimBLEAddress addr;
+  std::string mac, name;
+  int rssi;
+  bool fff0;
+  Found(const NimBLEAddress& a, const std::string& m, const std::string& n, int r, bool f)
+    : addr(a), mac(m), name(n), rssi(r), fff0(f) {}
+};
+
+struct Bms {
+  Found dev;
+  bool ok = false;
+  uint32_t lastOk = 0;
+  float v = 0, a = 0, soc = 0;
+  int maxMv = 0, minMv = 0, tMax = 0, tMin = 0;
+  uint8_t state = 0, chg = 0, dis = 0, cells = 0, temps = 0;
+  uint16_t cycles = 0;
+  uint32_t remMah = 0;
+  uint16_t mv[48] = {0};
+  explicit Bms(const Found& f) : dev(f) {}
+};
+
+static std::vector<Found> seen;
+static std::vector<Bms> bms;
+
+// ================= RX STATE =================
+static Bms* cur = nullptr;
+static bool gotCmd[256];
+static bool f95[16];
+static int frames95 = 0, base95 = -1;
+static uint8_t acc[256];
+static size_t accLen = 0;
+static uint8_t isrBuf[512];
+static volatile size_t isrLen = 0;
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ================= HELPERS =================
+static std::string lc(std::string s) {
+  for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+  return s;
+}
+
+static const char* hint(int rc) {
+  switch (rc) {
+    case 0:     return "no error code (timeout or refused)";
+    case 2:     return "EALREADY: another scan/connect procedure is still active in the BLE host";
+    case 15:    return "EBUSY: scan still running";
+    case 13:    return "host timeout";
+    case 0x23E: return "connection not established: BMS busy (phone app open?), out of range, or wrong addr type";
+    case 0x208: return "link lost (supervision timeout)";
+    case 0x213: return "remote side terminated (BMS dropped us)";
+    case 0x216: return "terminated by local host";
+    default:    return "see NimBLE BLE_HS_* / HCI error table";
+  }
+}
+
+static bool checksumOk(const uint8_t* f) {
+  uint8_t s = 0;
+  for (int i = 0; i < 12; i++) s += f[i];
+  return s == f[12];
+}
+
+// ================= FRAME PARSER =================
+static void parseFrame(const uint8_t* f) {
+  uint8_t cmd = f[2];
+  const uint8_t* p = f + 4;
+  if (VERBOSE) {
+    Serial.printf("  <- %02X:", cmd);
+    for (int i = 0; i < 13; i++) Serial.printf(" %02X", f[i]);
+    Serial.println();
+  }
+  gotCmd[cmd] = true;
+  if (!cur) return;
+  Bms& b = *cur;
+  switch (cmd) {
+    case 0x90:
+      b.v   = ((p[0] << 8) | p[1]) / 10.0f;
+      b.a   = (((p[4] << 8) | p[5]) - 30000) / 10.0f;
+      b.soc = ((p[6] << 8) | p[7]) / 10.0f;
+      break;
+    case 0x91:
+      b.maxMv = (p[0] << 8) | p[1];
+      b.minMv = (p[3] << 8) | p[4];
+      break;
+    case 0x92:
+      b.tMax = p[0] - 40;
+      b.tMin = p[2] - 40;
+      break;
+    case 0x93:
+      b.state = p[0]; b.chg = p[1]; b.dis = p[2];
+      b.remMah = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | (p[6] << 8) | p[7];
+      break;
+    case 0x94:
+      b.cells = p[0]; b.temps = p[1];
+      b.cycles = (p[5] << 8) | p[6];
+      break;
+    case 0x95: {
+      int no = p[0];
+      if (base95 < 0) base95 = (no == 0) ? 0 : 1;
+      int idx = no - base95;
+      if (idx < 0 || idx >= 16) break;
+      for (int i = 0; i < 3; i++) {
+        int ci = idx * 3 + i;
+        if (ci < 48) b.mv[ci] = (p[1 + 2 * i] << 8) | p[2 + 2 * i];
+      }
+      if (!f95[idx]) { f95[idx] = true; frames95++; }
+      break;
+    }
+    default: break;
+  }
+}
+
+// notify callback runs in the NimBLE host task: only buffer here
+static void onNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
+  portENTER_CRITICAL(&mux);
+  if (isrLen + n <= sizeof(isrBuf)) { memcpy(isrBuf + isrLen, d, n); isrLen += n; }
+  portEXIT_CRITICAL(&mux);
+}
+
+static void pump() {
+  static uint8_t tmp[512];
+  size_t n;
+  portENTER_CRITICAL(&mux);
+  n = isrLen;
+  memcpy(tmp, isrBuf, n);
+  isrLen = 0;
+  portEXIT_CRITICAL(&mux);
+  if (!n) return;
+  if (accLen + n > sizeof(acc)) accLen = 0;
+  memcpy(acc + accLen, tmp, n);
+  accLen += n;
+  while (accLen >= 13) {
+    if (acc[0] != 0xA5 || !checksumOk(acc)) {      // resync byte by byte
+      memmove(acc, acc + 1, accLen - 1);
+      accLen--;
+      continue;
+    }
+    parseFrame(acc);
+    memmove(acc, acc + 13, accLen - 13);
+    accLen -= 13;
+  }
+}
+
+static bool waitCmd(uint8_t cmd, uint32_t ms) {
+  uint32_t t = millis();
+  while (millis() - t < ms) {
+    pump();
+    if (gotCmd[cmd]) return true;
+    delay(10);
+  }
+  pump();
+  return gotCmd[cmd];
+}
+
+static bool sendCmd(NimBLERemoteCharacteristic* wr, uint8_t cmd) {
+  uint8_t p[13] = {0xA5, 0x40, cmd, 0x08};
+  uint8_t s = 0;
+  for (int i = 0; i < 12; i++) s += p[i];
+  p[12] = s;
+  gotCmd[cmd] = false;
+  if (VERBOSE) Serial.printf("  -> %02X\n", cmd);
+  return wr->writeValue(p, 13, wr->canWrite());
+}
+
+static void dumpGatt(NimBLEClient* c) {
+  for (auto* s : c->getServices(true)) {
+    Serial.printf("  svc %s\n", s->getUUID().toString().c_str());
+    for (auto* ch : s->getCharacteristics(true)) {
+      Serial.printf("    chr %s%s%s%s%s\n", ch->getUUID().toString().c_str(),
+                    ch->canRead() ? " R" : "", ch->canWrite() ? " W" : "",
+                    ch->canWriteNoResponse() ? " Wn" : "", ch->canNotify() ? " N" : "");
+    }
+  }
+}
+
+// ================= POLL ONE BMS =================
+static bool pollOne(Bms& b) {
+  cur = &b;
+  b.ok = false;
+  accLen = 0;
+  portENTER_CRITICAL(&mux); isrLen = 0; portEXIT_CRITICAL(&mux);
+
+  Serial.printf("[%s] connecting (%s, addrType %d)...\n", b.dev.mac.c_str(),
+                b.dev.name.c_str(), (int)b.dev.addr.getType());
+  Serial.printf("[%s] rssi at scan %d\n", b.dev.mac.c_str(), b.dev.rssi);
+
+  NimBLEScan* sc = NimBLEDevice::getScan();
+  if (sc->isScanning()) {
+    Serial.println("  [ble] stopping active scan before connect");
+    sc->stop();
+    for (int i = 0; i < 50 && sc->isScanning(); i++) delay(20);
+  }
+  if (sc->isScanning()) {
+    Serial.println("  [ble] scan is still active; skipping connect");
+    return false;
+  }
+
+  NimBLEClient* c = NimBLEDevice::createClient();
+  if (c == nullptr) {
+    Serial.println("  [ble] could not create client");
+    return false;
+  }
+  c->setConnectTimeout(CONNECT_MS);
+  c->setConnectionParams(CONN_MIN, CONN_MAX, 0, 400);
+
+  uint32_t t0 = millis();
+  // Keep the connection attempt synchronous and skip MTU negotiation to isolate link setup.
+  const bool conOk = c->connect(b.dev.addr, true, false, false);
+  if (!conOk) {
+    const int e = c->getLastError();
+    Serial.printf("[%s] CONNECT FAIL rc=%d (0x%X): %s  [%lu ms]\n", b.dev.mac.c_str(),
+                  e, e, hint(e), (unsigned long)(millis() - t0));
+    NimBLEDevice::deleteClient(c);
+    return false;
+  }
+  Serial.printf("[%s] connected in %lu ms, MTU %u\n", b.dev.mac.c_str(),
+                (unsigned long)(millis() - t0), (unsigned)c->getMTU());
+
+  bool good = false;
+  NimBLERemoteService* s = c->getService(SVC_UUID);
+  if (!s) {
+    Serial.println("  service FFF0 not found, GATT dump:");
+    dumpGatt(c);
+  } else {
+    NimBLERemoteCharacteristic* ntf = s->getCharacteristic(NTF_UUID);
+    NimBLERemoteCharacteristic* wr  = s->getCharacteristic(WR_UUID);
+    if (!ntf || !wr) {
+      Serial.println("  FFF1/FFF2 not found, GATT dump:");
+      dumpGatt(c);
+    } else if (!ntf->subscribe(true, onNotify)) {
+      Serial.println("  subscribe FAILED");
+    } else {
+      delay(300);
+      memset(gotCmd, 0, sizeof(gotCmd));
+      memset(f95, 0, sizeof(f95));
+      frames95 = 0; base95 = -1;
+
+      static const uint8_t CMDS[] = {0x94, 0x90, 0x91, 0x92, 0x93};
+      for (uint8_t cmd : CMDS) {
+        if (!sendCmd(wr, cmd)) Serial.printf("  write %02X FAILED\n", cmd);
+        if (!waitCmd(cmd, 800)) Serial.printf("  no reply to %02X\n", cmd);
+        delay(80);
+      }
+      // cell voltages: one request, several frames back
+      int need = ((b.cells ? b.cells : 16) + 2) / 3;
+      if (need > 16) need = 16;
+      sendCmd(wr, 0x95);
+      uint32_t t = millis();
+      while (millis() - t < 1500 && frames95 < need) { pump(); delay(10); }
+      if (frames95 < need) Serial.printf("  cells: got %d/%d frames\n", frames95, need);
+
+      good = gotCmd[0x90];
+    }
+  }
+
+  c->disconnect();
+  delay(100);
+  NimBLEDevice::deleteClient(c);
+
+  b.ok = good;
+  if (good) {
+    b.lastOk = millis();
+    Serial.printf("[%s] OK  %.1fV %.1fA SOC %.1f%%\n", b.dev.mac.c_str(), b.v, b.a, b.soc);
+  }
+  return good;
+}
+
+// ================= SCAN / TARGETS =================
+static void doScan() {
+  seen.clear();
+  NimBLEScan* sc = NimBLEDevice::getScan();
+  sc->setActiveScan(true);
+  sc->setInterval(100);
+  sc->setWindow(99);
+  Serial.printf("[scan] %d ms...\n", SCAN_MS);
+  NimBLEScanResults r = sc->getResults(SCAN_MS, false);
+  for (int i = 0; i < (int)r.getCount(); i++) {
+    const NimBLEAdvertisedDevice* d = r.getDevice(i);
+    Found f(d->getAddress(), lc(d->getAddress().toString()),
+            d->haveName() ? d->getName() : std::string(), d->getRSSI(),
+            d->isAdvertisingService(NimBLEUUID(SVC_UUID)));
+    Serial.printf("  %s  rssi %4d  type %d  %-20s %s\n", f.mac.c_str(), f.rssi,
+                  (int)d->getAddress().getType(), f.name.c_str(), f.fff0 ? "[FFF0]" : "");
+    seen.push_back(f);
+  }
+  sc->clearResults();
+  Serial.printf("[scan] %u devices\n", (unsigned)seen.size());
+}
+
+static void buildTargets() {
+  bms.clear();
+  if (BMS_MACS[0]) {
+    for (int i = 0; BMS_MACS[i] && bms.size() < MAX_BMS; i++) {
+      std::string m = lc(BMS_MACS[i]);
+      bool hit = false;
+      for (auto& f : seen) if (f.mac == m) { bms.emplace_back(f); hit = true; break; }
+      if (!hit) {
+        Serial.printf("[cfg] %s NOT seen in scan (busy with phone? out of range?) - trying anyway\n", m.c_str());
+        bms.emplace_back(Found(NimBLEAddress(m, BLE_ADDR_PUBLIC), m, "", 0, false));
+      }
+    }
+  } else {
+    for (auto& f : seen) {
+      if (bms.size() >= MAX_BMS) break;
+      if (f.name.rfind(NAME_PREFIX, 0) == 0 || f.fff0) bms.emplace_back(f);
+    }
+  }
+  Serial.printf("[cfg] %u BMS target(s)\n", (unsigned)bms.size());
+}
+
+// ================= JSON =================
+static void printJson() {
+  String j = "{\"ts\":" + String(millis() / 1000) + ",\"bms\":[";
+  float sv = 0, sa = 0, ssoc = 0, sah = 0;
+  int n = 0;
+  for (size_t i = 0; i < bms.size(); i++) {
+    Bms& b = bms[i];
+    if (i) j += ',';
+    j += "{\"id\":" + String(i) + ",\"mac\":\"" + b.dev.mac.c_str() + "\",\"name\":\"" + b.dev.name.c_str() + "\"";
+    j += ",\"ok\":" + String(b.ok ? "true" : "false");
+    j += ",\"age\":" + String(b.lastOk ? (millis() - b.lastOk) / 1000 : -1);
+    j += ",\"v\":" + String(b.v, 1) + ",\"a\":" + String(b.a, 1) + ",\"w\":" + String(b.v * b.a, 0);
+    j += ",\"soc\":" + String(b.soc, 1) + ",\"rem_ah\":" + String(b.remMah / 1000.0f, 1);
+    j += ",\"min_mv\":" + String(b.minMv) + ",\"max_mv\":" + String(b.maxMv);
+    j += ",\"t_min\":" + String(b.tMin) + ",\"t_max\":" + String(b.tMax);
+    j += ",\"state\":" + String(b.state) + ",\"chg\":" + String(b.chg) + ",\"dis\":" + String(b.dis);
+    j += ",\"cycles\":" + String(b.cycles) + ",\"cv\":[";
+    for (int k = 0; k < b.cells && k < 48; k++) { if (k) j += ','; j += String(b.mv[k]); }
+    j += "]}";
+    if (b.ok) { sv += b.v; sa += b.a; ssoc += b.soc; sah += b.remMah / 1000.0f; n++; }
+  }
+  j += "],\"group\":{\"online\":" + String(n);
+  if (n) {
+    j += ",\"soc\":" + String(ssoc / n, 1) + ",\"v\":" + String(sv / n, 1) +
+         ",\"a\":" + String(sa, 1) + ",\"w\":" + String((sv / n) * sa, 0) + ",\"ah\":" + String(sah, 1);
+  }
+  j += "}}";
+  Serial.println(j);
+}
+
+// ================= MAIN =================
+static void pollAll() {
+  Serial.printf("\n=== poll cycle, heap %u ===\n", (unsigned)ESP.getFreeHeap());
+  int okCount = 0;
+  for (auto& b : bms) {
+    bool ok = pollOne(b);
+    if (ok) okCount++;
+    delay(1000);                                  // pause before next BMS
+  }
+  printJson();
+  static int failStreak = 0;
+  failStreak = (okCount == 0) ? failStreak + 1 : 0;
+  if (failStreak >= 2) {
+    Serial.println("[auto] nothing reachable twice in a row, rescanning");
+    doScan();
+    buildTargets();
+    failStreak = 0;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nDaly BLE poller, NimBLE-Arduino 2.x");
+  NimBLEDevice::init("esp32-daly");
+  doScan();
+  buildTargets();
+}
+
+void loop() {
+  static uint32_t last = 0;
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 's') { doScan(); buildTargets(); }
+    if (ch == 'p') last = 0;
+  }
+  if (last == 0 || millis() - last >= POLL_INTERVAL_MS) {
+    if (bms.empty()) { Serial.println("[cfg] no targets, rescanning"); doScan(); buildTargets(); }
+    else pollAll();
+    last = millis();
+    if (last == 0) last = 1;
+  }
+  delay(20);
+}

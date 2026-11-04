@@ -1,0 +1,484 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+
+#define BMS_MAC_ADDRESS "YOUR_BMS_MAC"
+
+#define SERVICE_UUID_MAIN "0000fff0-0000-1000-8000-00805f9b34fb"
+#define CHAR_UUID_TX "0000fff1-0000-1000-8000-00805f9b34fb" // NOTIFY (BMS->Host)
+#define CHAR_UUID_RX "0000fff2-0000-1000-8000-00805f9b34fb" // WRITE (Host->BMS)
+
+// Default fallback cell count until 0x94 arrives
+static int expectedCellCount = 12;
+static int expectedFramesNeeded = (expectedCellCount + 2) / 3;
+
+// Buffers and state
+static float cellVoltages[48];     // up to 48 cells
+static uint16_t cellRawMv[48];     // raw mV values
+static bool frameReceived[16];     // up to 16 frames
+static int framesReceivedCount = 0;
+static bool assembled = false;     // set true after we've printed assembled cells
+
+// For determining whether 0x95 frame numbering is 0-based or 1-based
+static bool frameBaseDetected = false;
+static int frameBase = 0; // 0 => frames start at 0, 1 => frames start at 1
+
+// stream buffer for incoming BLE notifications (they may contain many 13-byte frames)
+static uint8_t rxStreamBuf[1024];
+static size_t rxStreamLen = 0;
+
+// NimBLE handles
+static NimBLEClient* pClient = nullptr;
+static NimBLERemoteCharacteristic* pTxCharacteristic = nullptr;
+static NimBLERemoteCharacteristic* pRxCharacteristic = nullptr;
+static bool connected = false;
+static bool scanning = false;
+
+// Basic BMS info
+struct BMSDeviceInfo {
+  NimBLEAddress address;
+  String name;
+  int rssi;
+  bool found;
+} bmsInfo;
+
+bool verifyChecksum(const uint8_t* pkt, size_t len) {
+  if (len < 2) return false;
+  uint8_t sum = 0;
+  for (size_t i = 0; i < len - 1; ++i) sum += pkt[i];
+  return (sum == pkt[len - 1]);
+}
+
+void recomputeExpectedFrames() {
+  if (expectedCellCount < 1) expectedCellCount = 12;
+  if (expectedCellCount > 48) expectedCellCount = 48;
+  expectedFramesNeeded = (expectedCellCount + 3 - 1) / 3; // ceil div3
+}
+
+// reset assembly state (but keep detected frameBase)
+void resetCellAssembly() {
+  memset(cellVoltages, 0, sizeof(cellVoltages));
+  memset(cellRawMv, 0, sizeof(cellRawMv));
+  memset(frameReceived, 0, sizeof(frameReceived));
+  framesReceivedCount = 0;
+  assembled = false;
+}
+
+// convert raw mV to "mV (V)" string printing per user's option 1C
+void printCellVoltages() {
+  Serial.println();
+  Serial.println("--- DALY FRAME CMD=0x95 ---");
+  Serial.println("===============================================");
+  Serial.println("--- Cell Voltages ---");
+  for (int i = 0; i < expectedCellCount; ++i) {
+    uint16_t mv = cellRawMv[i];
+    float v = mv / 1000.0f;
+    Serial.printf("Cell %02d: %u mV (%.3f V)\n", i + 1, mv, v);
+  }
+  Serial.println("--- End Cell Voltages ---");
+  Serial.println("===============================================");
+}
+
+// parse a single 13-byte DALY frame
+void parseFrame(const uint8_t* frame) {
+  if (frame[0] != 0xA5) return;
+  if (!verifyChecksum(frame, 13)) return;
+
+  uint8_t cmd  = frame[2];
+  const uint8_t* payload = frame + 4; // payload[0..7]
+
+  switch (cmd) {
+    case 0x90: {
+      uint16_t total_raw = (payload[0] << 8) | payload[1];
+      uint16_t accum_raw = (payload[2] << 8) | payload[3];
+      uint16_t current_raw = (payload[4] << 8) | payload[5];
+      uint16_t soc_raw = (payload[6] << 8) | payload[7];
+
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x90 ---");
+      Serial.println("===============================================");
+      Serial.println("Basic Status Info: Voltage, Current, SOC");
+      Serial.println("------------------------------------------------");
+
+      Serial.printf("Total Voltage: %.1f V\n", total_raw / 10.0f);
+      Serial.printf("Accum Voltage: %.1f V\n", accum_raw / 10.0f);
+      Serial.printf("Current: %.1f A\n", ((int)current_raw - 30000) / 10.0f);
+      Serial.printf("SOC: %.1f %%\n", soc_raw / 10.0f);
+
+      Serial.println("===============================================");
+      break;
+    }
+    case 0x91: {
+      uint16_t max_mv = (payload[0] << 8) | payload[1];
+      uint8_t max_no = payload[2];
+      uint16_t min_mv = (payload[3] << 8) | payload[4];
+      uint8_t min_no = payload[5];
+
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x91 ---");
+      Serial.println("===============================================");
+      Serial.println("Min/Max Cell Voltage Info:");
+      Serial.println("------------------------------------------------");
+
+      Serial.printf("MaxCell %d: %.3f V\n", max_no, max_mv / 1000.0f);
+      Serial.printf("MinCell %d: %.3f V\n", min_no, min_mv / 1000.0f);
+      Serial.printf("Voltage Difference: %.3fV (%dmV)\n", (max_mv - min_mv) / 1000.0f, (max_mv - min_mv));
+      Serial.println("===============================================");
+      break;
+}
+
+case 0x92: {
+      float max_t = payload[0] - 40.0f;
+      uint8_t max_no = payload[1];
+      float min_t = payload[2] - 40.0f;
+      uint8_t min_no = payload[3];
+
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x92 ---");
+      Serial.println("===============================================");
+      Serial.println("Temperature Info:");
+      Serial.println("------------------------------------------------");
+      Serial.printf("MaxTemp: %.1f C (sensor %d)\n", max_t, max_no);
+      Serial.printf("MinTemp: %.1f C (sensor %d)\n", min_t, min_no);
+      Serial.println("===============================================");
+      break;
+}
+
+case 0x93: {
+      uint8_t state = payload[0];
+      uint8_t chargeMOS = payload[1];
+      uint8_t dischargeMOS = payload[2];
+
+      uint32_t remCap =
+          ((uint32_t)payload[4] << 24) |
+          ((uint32_t)payload[5] << 16) |
+          ((uint32_t)payload[6] << 8) |
+           payload[7];
+
+      const char* stateStr = "Unknown";
+      if (state == 0) stateStr = "Stationary";
+      else if (state == 1) stateStr = "Charging";
+      else if (state == 2) stateStr = "Discharging";
+
+      const char* chargeMOSstr    = (chargeMOS == 1)    ? "ON" : "OFF";
+      const char* dischargeMOSstr = (dischargeMOS == 1) ? "ON" : "OFF";
+
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x93 ---");
+      Serial.println("===============================================");
+      Serial.println("BMS State Info:");
+      Serial.println("------------------------------------------------");
+      Serial.printf("State: %s (%d)\n", stateStr, state);
+      Serial.printf("Charge MOS: %s\n", chargeMOSstr);
+      Serial.printf("Discharge MOS: %s\n", dischargeMOSstr);
+      Serial.printf("Remaining Capacity: %u mAh\n", remCap);
+      Serial.println("===============================================");
+      break;
+    }
+    case 0x94: {
+      uint8_t batteryStrings = payload[0];  // number of cells
+      uint8_t tempCount      = payload[1];  // temp sensors
+      uint8_t chargerStatus  = payload[2];  // 0=disconnected, 1=connected
+      uint8_t loadStatus     = payload[3];  // 0=disconnected, 1=connected
+      uint16_t cycles = (payload[5] << 8) | payload[6]; // bytes 5-6
+
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x94 ---");
+      Serial.println("===============================================");
+      Serial.println("Battery Configuration Info:");
+      Serial.println("------------------------------------------------");
+      Serial.printf("Cells: %d cells\n", batteryStrings);
+      Serial.printf("Temperature Sensors: %d\n", tempCount);
+      Serial.printf("Charger Status: %s\n", chargerStatus ? "Connected" : "Disconnected");
+      Serial.printf("Load Status: %s\n", loadStatus ? "Connected" : "Disconnected");
+      Serial.printf("Charge Cycles: %d\n", cycles);
+      Serial.println("===============================================");
+
+      if (batteryStrings >= 1 && batteryStrings <= 48) {
+          expectedCellCount = batteryStrings;
+          recomputeExpectedFrames();
+          resetCellAssembly();
+      }
+      break;
+    }
+    case 0x95: {
+      uint8_t rawFrameNo = payload[0];
+
+      if (!frameBaseDetected) {
+        if (rawFrameNo == 0) frameBase = 0;
+        else frameBase = 1;
+        frameBaseDetected = true;
+      }
+
+      int idx = (int)rawFrameNo - frameBase; // remap to 0-based index
+      if (idx < 0 || idx >= 16) break;
+
+      if (assembled) break;
+      if (frameReceived[idx]) break;
+
+      for (int i = 0; i < 3; ++i) {
+        int p = 1 + i * 2;
+        uint16_t mv = (payload[p] << 8) | payload[p + 1];
+        int cellIndex = idx * 3 + i; // 0-based
+        if (cellIndex < expectedCellCount) {
+          if (mv == 0xFFFF || mv == 0x0000) {
+            cellRawMv[cellIndex] = 0;
+          } else {
+            cellRawMv[cellIndex] = mv;
+            cellVoltages[cellIndex] = mv / 1000.0f;
+          }
+        }
+      }
+
+      frameReceived[idx] = true;
+      framesReceivedCount++;
+
+      bool allGot = true;
+      for (int f = 0; f < expectedFramesNeeded; ++f) {
+        if (!frameReceived[f]) { allGot = false; break; }
+      }
+      if (allGot) {
+        printCellVoltages();
+        assembled = true;
+      }
+      break;
+    }
+    case 0x97: {
+      Serial.println();
+      Serial.println("--- DALY FRAME CMD=0x97 ---");
+      Serial.println("===============================================");
+      Serial.println("Cell Balance State (0=Closed, 1=Open):");
+      Serial.println("------------------------------------------------");
+
+      for (int i = 0; i < expectedCellCount; ++i) {
+          int byteIndex = i / 8;
+          int bitIndex  = i % 8;
+          bool balanced = (payload[byteIndex] >> bitIndex) & 0x01;
+          Serial.printf("Cell %02d: %s\n", i + 1, balanced ? "Open" : "Closed");
+      }
+      Serial.println("===============================================");
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Process rxStreamBuf: extract any number of complete 13-byte frames
+void processRxStream() {
+  while (rxStreamLen >= 13) {
+    if (rxStreamBuf[0] != 0xA5) {
+      size_t pos = 0;
+      while (pos < rxStreamLen && rxStreamBuf[pos] != 0xA5) ++pos;
+      if (pos == rxStreamLen) { rxStreamLen = 0; return; }
+      if (pos > 0) {
+        memmove(rxStreamBuf, rxStreamBuf + pos, rxStreamLen - pos);
+        rxStreamLen -= pos;
+      }
+      if (rxStreamLen < 13) return;
+    }
+    uint8_t frame[13];
+    memcpy(frame, rxStreamBuf, 13);
+    memmove(rxStreamBuf, rxStreamBuf + 13, rxStreamLen - 13);
+    rxStreamLen -= 13;
+    parseFrame(frame);
+  }
+}
+
+// Notification callback
+static void notifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic,
+                     uint8_t* pData, size_t length, bool isNotify) {
+  if (rxStreamLen + length > sizeof(rxStreamBuf)) {
+    rxStreamLen = 0;
+  }
+  memcpy(rxStreamBuf + rxStreamLen, pData, length);
+  rxStreamLen += length;
+  processRxStream();
+}
+
+class MyAdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* dev) override {
+    String addr = dev->getAddress().toString().c_str();
+    addr.toLowerCase();
+    if (addr == BMS_MAC_ADDRESS) {
+      bmsInfo.address = dev->getAddress();
+      bmsInfo.name = dev->haveName() ? dev->getName().c_str() : "";
+      bmsInfo.rssi = dev->getRSSI();
+      bmsInfo.found = true;
+      if (scanning) {
+        NimBLEDevice::getScan()->stop();
+        scanning = false;
+      }
+    }
+  }
+};
+
+class ClientCallbacks : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient* pClient) override {
+    connected = true;
+    resetCellAssembly();
+    rxStreamLen = 0;
+    frameBaseDetected = false;
+  }
+  void onDisconnect(NimBLEClient* pClient) override {
+    connected = false;
+    pRxCharacteristic = nullptr;
+    pTxCharacteristic = nullptr;
+    resetCellAssembly();
+    rxStreamLen = 0;
+    if (::pClient) {
+      NimBLEDevice::deleteClient(::pClient);
+      ::pClient = nullptr;
+    }
+  }
+};
+
+void scanForBMS(int durationSeconds) {
+  bmsInfo.found = false;
+  scanning = true;
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->setInterval(80);
+  scan->setWindow(60);
+  scan->setMaxResults(0);
+  scan->start(durationSeconds, false);
+
+  unsigned long start = millis();
+  while (millis() - start < (unsigned long)durationSeconds * 1000 + 1000) {
+    if (!scanning) break;
+    delay(100);
+  }
+  if (scanning) {
+    scan->stop();
+    scanning = false;
+  }
+}
+
+void sendDalyRequest(uint8_t cmd, const uint8_t payload8[8] = nullptr) {
+  if (!pRxCharacteristic || !connected) return;
+  if (cmd == 0x95) {
+    resetCellAssembly();
+    frameBaseDetected = false;
+  }
+
+  uint8_t pkt[13];
+  pkt[0] = 0xA5;
+  pkt[1] = 0x40;
+  pkt[2] = cmd;
+  pkt[3] = 0x08;
+  for (int i = 0; i < 8; ++i) pkt[4 + i] = payload8 ? payload8[i] : 0x00;
+  uint8_t sum = 0;
+  for (int i = 0; i < 12; ++i) sum += pkt[i];
+  pkt[12] = sum;
+
+  if (pRxCharacteristic->canWrite()) {
+    pRxCharacteristic->writeValue(pkt, 13, true);
+  }
+}
+
+bool discoverAndSubscribe() {
+  if (!pClient || !pClient->isConnected()) return false;
+  NimBLERemoteService* svc = pClient->getService(SERVICE_UUID_MAIN);
+  if (!svc) return false;
+  pTxCharacteristic = svc->getCharacteristic(CHAR_UUID_TX);
+  pRxCharacteristic = svc->getCharacteristic(CHAR_UUID_RX);
+  if (!pTxCharacteristic || !pRxCharacteristic) return false;
+  if (pTxCharacteristic->canNotify()) pTxCharacteristic->subscribe(true, notifyCB);
+  return true;
+}
+
+bool connectToBMS() {
+  if (!bmsInfo.found) return false;
+  if (pClient) { NimBLEDevice::deleteClient(pClient); pClient = nullptr; }
+  pClient = NimBLEDevice::createClient();
+  pClient->setClientCallbacks(new ClientCallbacks());
+  pClient->setConnectTimeout(5);
+  if (!pClient->connect(bmsInfo.address)) {
+    NimBLEDevice::deleteClient(pClient);
+    pClient = nullptr;
+    return false;
+  }
+  if (!discoverAndSubscribe()) {
+    pClient->disconnect();
+    NimBLEDevice::deleteClient(pClient);
+    pClient = nullptr;
+    return false;
+  }
+  return true;
+}
+
+void cleanupClient() {
+  if (pClient) { NimBLEDevice::deleteClient(pClient); pClient = nullptr; }
+  pRxCharacteristic = nullptr;
+  pTxCharacteristic = nullptr;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  NimBLEDevice::init("ESP32-Daly-UART-BLE");
+
+  recomputeExpectedFrames();
+  scanForBMS(8);
+
+  if (bmsInfo.found) {
+    if (connectToBMS()) {
+      connected = true;
+      delay(300);
+      sendDalyRequest(0x94);
+      delay(200);
+      sendDalyRequest(0x90); delay(120);
+      sendDalyRequest(0x91); delay(120);
+      sendDalyRequest(0x92); delay(120);
+      sendDalyRequest(0x93); delay(120);
+      sendDalyRequest(0x95);
+      sendDalyRequest(0x97);
+    }
+  }
+}
+
+void loop() {
+  static unsigned long lastPoll = 0;
+  if (connected && pClient && pClient->isConnected()) {
+    if (millis() - lastPoll > 1000) {
+      sendDalyRequest(0x90); delay(80);
+      sendDalyRequest(0x91); delay(80);
+      sendDalyRequest(0x92); delay(80);
+      sendDalyRequest(0x93); delay(80);
+      sendDalyRequest(0x94); delay(150);
+      sendDalyRequest(0x95);
+      sendDalyRequest(0x97);
+      lastPoll = millis();
+    }
+  } else {
+    static unsigned long lastReconnect = 0;
+    if (millis() - lastReconnect > 3000) {
+      cleanupClient();
+      scanForBMS(6);
+      if (bmsInfo.found) {
+        connectToBMS();
+      }
+      lastReconnect = millis();
+    }
+  }
+
+  if (Serial.available()) {
+    char c = Serial.read();
+    switch (c) {
+      case 'c': if (!connected && bmsInfo.found) connectToBMS(); break;
+      case 'd': if (pClient && pClient->isConnected()) pClient->disconnect(); cleanupClient(); connected = false; break;
+      case '0': sendDalyRequest(0x90); break;
+      case '1': sendDalyRequest(0x91); break;
+      case '2': sendDalyRequest(0x92); break;
+      case '3': sendDalyRequest(0x93); break;
+      case '4': sendDalyRequest(0x94); break;
+      case '5': sendDalyRequest(0x95); break;
+      case '6': sendDalyRequest(0x97); break;
+      case 'r': resetCellAssembly(); frameBaseDetected = false; break;
+      default: break;
+    }
+  }
+
+  delay(20);
+}
