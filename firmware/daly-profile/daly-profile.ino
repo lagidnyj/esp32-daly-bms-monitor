@@ -1,15 +1,24 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <LittleFS.h>
 #include <NimBLEDevice.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <cstring>
 #include <string>
+#include <time.h>
 
 static constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
 static constexpr char WIFI_PASSWORD[] = "YOUR_WIFI_PASSWORD";
 static constexpr char BMS_MAC[] = "YOUR_BMS_MAC";
+static constexpr char CONFIG_PATH[] = "/config.json";
+static constexpr uint32_t NTP_SYNC_TIMEOUT_MS = 15000;
+static constexpr time_t MIN_VALID_TIME = 1704067200;
+static constexpr uint32_t CLOUD_HTTP_TIMEOUT_MS = 5000;
+static constexpr uint32_t DEFAULT_CLOUD_INTERVAL_SEC = 60;
+static constexpr uint32_t CLOUD_RETRY_INTERVAL_MS = 30000;
 static constexpr uint32_t SCAN_DURATION_MS = 8000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS = 10000;
@@ -21,6 +30,13 @@ static constexpr char WRITE_UUID[] = "0000fff2-0000-1000-8000-00805f9b34fb";
 
 static WebServer server(80);
 static NimBLEAddress bmsAddress;
+static bool cloudEnabled = false;
+static String cloudUrl;
+static String cloudDeviceId;
+static String cloudDeviceToken;
+static uint32_t cloudIntervalMs = DEFAULT_CLOUD_INTERVAL_SEC * 1000;
+static uint32_t nextCloudAttemptAt = 0;
+static bool cloudAttemptScheduled = false;
 static NimBLEClient* client = nullptr;
 static NimBLERemoteCharacteristic* writeCharacteristic = nullptr;
 static uint32_t nextPollAt = 0;
@@ -53,6 +69,100 @@ static size_t receiveLength = 0;
 static uint8_t parseBuffer[256];
 static size_t parseLength = 0;
 static portMUX_TYPE receiveMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool readConfigString(JsonObjectConst config, const char* key,
+                             String& value, size_t maxLength) {
+  JsonVariantConst field = config[key];
+  if (!field.is<const char*>()) return false;
+  value = field.as<const char*>();
+  value.trim();
+  return value.length() > 0 && value.length() <= maxLength;
+}
+
+static void loadConfig() {
+  File configFile = LittleFS.open(CONFIG_PATH, "r");
+  if (!configFile) {
+    Serial.println("Cloud config not found; cloud reporting is disabled.");
+    return;
+  }
+  if (configFile.size() > 16384) {
+    Serial.println("Cloud config is too large; cloud reporting is disabled.");
+    configFile.close();
+    return;
+  }
+
+  DynamicJsonDocument config(12288);
+  const DeserializationError error = deserializeJson(config, configFile);
+  configFile.close();
+  if (error) {
+    Serial.printf("Cloud config parse failed: %s; cloud reporting is disabled.\n",
+                  error.c_str());
+    return;
+  }
+
+  JsonObjectConst cloud = config.as<JsonObjectConst>();
+  if (cloud.isNull()) {
+    Serial.println("Cloud config must be a JSON object; cloud reporting is disabled.");
+    return;
+  }
+
+  JsonVariantConst enabled = cloud["cloud_enabled"];
+  if (!enabled.is<bool>() || !enabled.as<bool>()) {
+    Serial.println("Cloud reporting is disabled by config.");
+    return;
+  }
+
+  if (!readConfigString(cloud, "server_url", cloudUrl, 256) ||
+      !cloudUrl.startsWith("https://")) {
+    Serial.println("Cloud server_url must be a valid HTTPS URL; cloud reporting is disabled.");
+    return;
+  }
+  if (!readConfigString(cloud, "device_id", cloudDeviceId, 128)) {
+    Serial.println("Cloud device_id is missing or invalid; cloud reporting is disabled.");
+    return;
+  }
+  if (!readConfigString(cloud, "device_token", cloudDeviceToken, 256)) {
+    Serial.println("Cloud device_token is missing or invalid; cloud reporting is disabled.");
+    return;
+  }
+
+  JsonVariantConst interval = cloud["cloud_interval_sec"];
+  if (interval.is<uint32_t>()) {
+    const uint32_t intervalSec = interval.as<uint32_t>();
+    if (intervalSec >= 60 && intervalSec <= 180) {
+      cloudIntervalMs = intervalSec * 1000UL;
+    } else {
+      Serial.println("Cloud interval must be 60-180 seconds; using 60 seconds.");
+    }
+  } else if (!interval.isNull()) {
+    Serial.println("Cloud interval is invalid; using 60 seconds.");
+  }
+
+  cloudEnabled = true;
+  Serial.printf("Cloud reporting enabled for device %s at %s (interval %lu sec)\n",
+                cloudDeviceId.c_str(), cloudUrl.c_str(),
+                static_cast<unsigned long>(cloudIntervalMs / 1000));
+}
+
+static bool isClockSynchronized() {
+  return time(nullptr) >= MIN_VALID_TIME;
+}
+
+static void synchronizeClock() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  Serial.print("Synchronizing system clock with NTP");
+  const uint32_t startedAt = millis();
+  while (!isClockSynchronized() &&
+         millis() - startedAt < NTP_SYNC_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+  if (isClockSynchronized()) {
+    Serial.println("\nSystem clock synchronized.");
+  } else {
+    Serial.println("\nNTP synchronization timed out; continuing without synchronized time.");
+  }
+}
 
 static bool checksumValid(const uint8_t* frame) {
   uint8_t sum = 0;
@@ -236,6 +346,7 @@ static bool pollBms() {
     client = nullptr;
     return false;
   }
+  Serial.println("BLE connected.");
 
   NimBLERemoteService* service = client->getService(SERVICE_UUID);
   NimBLERemoteCharacteristic* notifyCharacteristic =
@@ -280,6 +391,8 @@ static bool pollBms() {
     success = receivedCommand[0x90];
     if (success) {
       lastGoodPollAt = millis();
+      Serial.printf("Poll OK: SOC=%.1f%% Volt=%.2fV A=%.2fA\n",
+                    telemetry.soc, telemetry.voltage, telemetry.current);
     }
   }
 
@@ -291,9 +404,8 @@ static bool pollBms() {
   return success;
 }
 
-static void handleData() {
-  DynamicJsonDocument doc(4096);
-  JsonObject device = doc.createNestedObject(BMS_MAC);
+static void addDeviceState(JsonObject root) {
+  JsonObject device = root.createNestedObject(BMS_MAC);
   device["bms_type"] = "DALY A5";
   device["connected"] = lastGoodPollAt != 0 && millis() - lastGoodPollAt < POLL_INTERVAL_MS * 3;
   device["battery_voltage"] = telemetry.voltage;
@@ -361,9 +473,91 @@ static void handleData() {
   device["power_tube_overtemperature_protection_recovery"] = nullptr;
   device["short_circuit_protection_delay"] = nullptr;
 
+}
+
+static String buildDeviceState() {
+  DynamicJsonDocument doc(4096);
+  addDeviceState(doc.to<JsonObject>());
+  if (doc.overflowed()) {
+    Serial.println("Could not build device state JSON: document capacity exceeded.");
+    return String();
+  }
   String response;
   serializeJson(doc, response);
-  server.send(200, "application/json", response);
+  return response;
+}
+
+static void handleData() {
+  const String state = buildDeviceState();
+  if (state.length() == 0) {
+    server.send(500, "text/plain", "Failed to serialize device state.");
+    return;
+  }
+  server.send(200, "application/json", state);
+}
+
+static bool sendCloudUpdate() {
+  if (!cloudEnabled) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Cloud update skipped: Wi-Fi is disconnected.");
+    return false;
+  }
+
+  DynamicJsonDocument request(8192);
+  request["device_id"] = cloudDeviceId;
+  request["device_token"] = cloudDeviceToken;
+  addDeviceState(request.createNestedObject("payload"));
+  if (request.overflowed()) {
+    Serial.println("Cloud update failed: request JSON capacity exceeded.");
+    return false;
+  }
+  String body;
+  serializeJson(request, body);
+  if (body.length() == 0) {
+    Serial.println("Cloud update failed: unable to serialize request JSON.");
+    return false;
+  }
+
+  WiFiClientSecure tlsClient;
+  tlsClient.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(CLOUD_HTTP_TIMEOUT_MS);
+  http.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
+  if (!http.begin(tlsClient, cloudUrl)) {
+    Serial.println("Cloud update failed: unable to initialize HTTPS request.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  const int status = http.POST(body);
+  http.end();
+  if (status != HTTP_CODE_OK) {
+    if (status < 0) {
+      Serial.printf("POST failed: %s\n",
+                    HTTPClient::errorToString(status).c_str());
+    } else {
+      Serial.printf("POST cloud: HTTP %d\n", status);
+    }
+    return false;
+  }
+
+  Serial.println("POST cloud: 200 OK");
+  return true;
+}
+
+static void maybeSendCloudUpdate() {
+  if (!cloudEnabled) return;
+
+  const uint32_t now = millis();
+  if (cloudAttemptScheduled &&
+      static_cast<int32_t>(now - nextCloudAttemptAt) < 0) {
+    return;
+  }
+
+  const bool succeeded = sendCloudUpdate();
+  const uint32_t delayMs = succeeded ? cloudIntervalMs : CLOUD_RETRY_INTERVAL_MS;
+  nextCloudAttemptAt = millis() + delayMs;
+  cloudAttemptScheduled = true;
 }
 
 static void handleControl() {
@@ -420,9 +614,12 @@ void setup() {
     Serial.print('.');
   }
   Serial.printf("\nWi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
+  synchronizeClock();
 
   if (!LittleFS.begin()) {
     Serial.println("LittleFS mount failed.");
+  } else {
+    loadConfig();
   }
   server.serveStatic("/main", LittleFS, "/index.html");
   server.serveStatic("/lite", LittleFS, "/index_lite.html");
@@ -450,8 +647,15 @@ void loop() {
   if (!hasAddress) {
     hasAddress = scanForBms();
   }
-  if (hasAddress && !pollBms()) {
-    hasAddress = false;
+  bool pollSucceeded = false;
+  if (hasAddress) {
+    pollSucceeded = pollBms();
+    if (!pollSucceeded) {
+      hasAddress = false;
+    }
+  }
+  if (pollSucceeded) {
+    maybeSendCloudUpdate();
   }
   nextPollAt = millis() + POLL_INTERVAL_MS;
 }

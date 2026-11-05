@@ -1,0 +1,7 @@
+{
+  "cloud_enabled": false,
+  "server_url": "https://cloud.example.com/backend/api.php",
+  "device_id": "",
+  "device_token": "",
+  "cloud_interval_sec": 60
+}
