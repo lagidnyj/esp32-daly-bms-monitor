@@ -12,8 +12,12 @@ as part of this research note.
 - [BLE protocol tests](https://github.com/syssi/esphome-daly-bms/tree/main/tests/components/daly_bms_ble): sample frames and decoder tests for D2 and P81.
 - [BMS_BLE-HA DALY plugin](https://github.com/patman15/BMS_BLE-HA/blob/main/custom_components/bms_ble/plugins/daly_bms.py): another BLE implementation; its README lists DALY devices advertised as `DL-…`.
 - [User-supplied PlatformIO A5 example](../tools/examle): BLE polling/parser example for a different MAC address.
-- A local copy of DALY's UART/RS-485 protocol manual was consulted; the document
-  is not redistributed in this repository.
+- User-supplied local DALY UART/485 Communications Protocol V1.2 and D2
+  Modbus protocol spreadsheets were consulted as references; the files are
+  not included in this repository.
+- [matthewgream/DalyBMSInterface](https://github.com/matthewgream/DalyBMSInterface): modular Arduino/C++ DALY interface, combining documented and reverse-engineered commands.
+- [dreadnought/python-daly-bms](https://github.com/dreadnought/python-daly-bms): UART/Bluetooth library with separate protocol implementations and decoded errors.
+- [Sinowealth implementation](https://github.com/dreadnought/python-daly-bms/blob/main/dalybms/daly_sinowealth.py) and [A5 error text map](https://github.com/dreadnought/python-daly-bms/blob/main/dalybms/error_codes.py).
 
 The upstream component README also references the vendor protocol spreadsheet,
 `docs/dalyModbusProtocol.xlsx`, as the source for its D2 field definitions.
@@ -41,7 +45,69 @@ but its application protocol is different from D2/P81:
 - The example appears written for an older NimBLE-Arduino API (`NimBLEAdvertisedDeviceCallbacks`, one-argument `onDisconnect`). Its `setConnectTimeout(5)` also needs version checking: NimBLE 2.x measures timeout arguments in milliseconds, making `5` far too short.
 - Its notify subscription result is ignored, and the parser consumes each 13-byte chunk after checking only the start byte; a bad checksum drops that chunk without trying to resynchronize within it. Treat it as a useful protocol lead, not a validated production parser.
 
-For the TM battery, the next decisive evidence is a raw BLE capture from its own advertised device: service/characteristic UUIDs, address type, and at least one request/response pair. Until that is available, A5 is a plausible branch to test, not a confirmed TM protocol.
+For the TM battery, the next decisive evidence is a raw BLE capture from its own advertised device: service/characteristic UUIDs, address type, and at least one request/response pair. The supplied UART manual now independently documents the A5 serial protocol, but does not yet prove the TM module uses it over BLE.
+
+## Supplied UART/RS-485 A5 Protocol
+
+The supplied V1.2 UART/485 manual confirms an A5 message family, independently
+of the D2/P81 Modbus protocol:
+
+- Physical UART settings are 9600 baud, 8 data bits, no parity, 1 stop bit.
+- Host requests use `A5 40 <data-id> 08 <8 reserved bytes> <checksum>`; BMS replies use `A5 01 <data-id> 08 <8 data bytes> <checksum>`. The checksum is the low byte of the sum of the preceding 12 bytes.
+- The manual documents data IDs `0x90` through `0x98`. `0x96` returns individual battery temperatures, seven values per frame, with frame numbers starting at zero and a 40-degree offset. It describes up to 21 readings across three frames (despite the heading saying sensors 1-16).
+- `0x98` is an eight-byte battery-failure/alarm bitfield, including MOS temperature alarms and MOS temperature sensor faults. The manual does not describe a live MOSFET temperature value in these A5 telemetry responses.
+- The manual describes `0x93` byte 3 as BMS life / 0-255 cycles and marks bytes 5-7 of `0x94` reserved. However, the project owner has verified that the current `0x94` bytes 5-6 cycle-count decoding reports the correct cycle count on the target BMS. Preserve the observed working mapping unless new target-device evidence contradicts it.
+- The manual does not list a software- or hardware-version query among A5 IDs `0x90`-`0x98`.
+
+The two supplied XLSX files describe D2 Modbus frames (`0xD2`, function
+`0x03`/`0x06`/`0x10`, CRC-16), not the fixed-length A5 frames. Their D2
+register map lists software version at `0xA9`-`0xB0` and hardware version at
+`0xB1`-`0xB8`. These addresses must not be sent as A5 data IDs or assumed to
+work through the A5 BLE module.
+
+The A5 UART document makes `0x96` and `0x98` concrete commands to investigate
+for this project. However, the UART manual alone does not prove that the
+particular BLE module forwards those UART messages unchanged. Confirm by
+requesting these IDs over BLE and recording the responses before adding them
+to the production parser. The `0x96` readings could provide individual sensor
+temperatures; `0x98` can provide alarm flags but not the MOSFET temperature
+itself according to this manual.
+
+## Additional DALY Implementations and Alerts
+
+The two additional repositories provide useful independent references, but
+they cover more than one DALY protocol family:
+
+- `python-daly-bms`'s standard UART implementation identifies the A5 `0x98`
+  response as battery-failure status and maps its bits to alarm text in
+  `error_codes.py`. The documented categories include voltage, temperature,
+  current, SOC, voltage/temperature difference, MOS temperature/sensor/MOS
+  faults, AFE/collection, EEPROM/RTC, precharge, communications, and current
+  module faults. This aligns with the supplied V1.2 manual and with the user's
+  observation that the official app displays alerts.
+- The same repository's standard UART implementation requests individual
+  sensor temperatures with `0x96`, cell balancing with `0x97`, and errors with
+  `0x98`. Its Bluetooth adapter instead requests `0x95` for temperatures,
+  `0x96` for balancing, and `0x97` for errors, while using a different BLE
+  write/notification setup. Treat that command mapping as adapter/protocol
+  specific; do not copy it blindly into this sketch's FFF0/FFF1/FFF2 A5
+  transport. Confirm raw request/response IDs from the target module.
+- `python-daly-bms/daly_sinowealth.py` explicitly targets the BMStool /
+  Sinowealth variant. It reads a different register-style command set (for
+  example, cell voltages `0x01`-`0x0A`, temperatures `0x0C`-`0x0F`, cycles
+  `0x14`, pack status `0x15`, and battery status `0x16`). Those IDs and its
+  status-bit labels are not interchangeable with A5 data IDs.
+- `DalyBMSInterface` documents A5 status/diagnostic commands `0x90`-`0x98`
+  and also implements additional information and threshold commands that its
+  README describes as reverse-engineered. Its command names/availability do
+  not establish that every DALY model or BLE module supports those commands.
+
+Taken together, the references make A5 alarm parsing via `0x98` and individual
+temperature parsing via `0x96` promising next steps. The alert list in the
+Python implementation is a mapping of the A5 failure bits, not evidence that
+the different Sinowealth `0x16` status register has the same layout. Likewise,
+the repositories do not establish that the user's BLE module exposes all
+UART-documented or reverse-engineered commands unchanged.
 
 ## Connection Topology
 
@@ -97,9 +163,9 @@ target model before promising those fields or controls.
 
 ## Open Verification
 
-The local PDF is named as a UART/RS-485 protocol document and is seven pages.
-Its text has not yet been extracted in this environment, so equivalence between
-its serial framing and the BLE payloads above remains unverified. The next
-useful step is to extract/inspect it and compare frame headers, register maps,
-and CRC rules with the BLE implementation, then check whether the target BLE
-module exposes that same payload or uses a separate BLE protocol.
+The supplied UART manual confirms the A5 serial framing and documents
+commands `0x96` and `0x98`. Still verify that the target BLE module forwards
+these A5 requests and replies unchanged, confirm the cycle-count field against
+a real frame, and identify whether the target hardware exposes any proprietary
+version query beyond the documented A5 IDs. The D2 Modbus XLSX register map is
+not evidence that its version registers are available over this A5 BLE link.

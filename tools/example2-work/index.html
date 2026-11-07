@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>BMS Monitor</title>
+<link rel="stylesheet" href="bms.css">
+</head>
+<body>
+<main>
+  <section id="pack"></section>
+  <section id="grid" class="grid"></section>
+</main>
+
+<script>
+const CFG = {
+  DATA_URL: '/data',
+  POLL_MS: 2000,
+  TITLE_PRIORITY: ['mac','name','id'],
+  PACK_TITLE: 'Battery Pack',
+  PACK_VOLTAGE: 'avg',        // 'avg' — паралельні АКБ; 'sum' — послідовні
+  CHARGE_POSITIVE: true       // true: струм >0 = заряд
+};
+const F = { list:'devices', id:'id', mac:'mac', name:'name', connected:'connected',
+            voltage:'battery_voltage', current:'charge_current', power:'battery_power',
+            remain_ah:'capacity_remain', soc:'percent_remain', alarm:'alarm' };
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = v => (v === null || v === '' || v === undefined || !Number.isFinite(+v)) ? null : +v;
+const fx = (v, d = 1) => v == null ? '—' : v.toFixed(d);
+const fxP = w => w == null ? ['—','W'] : Math.abs(w) >= 1000 ? [(w/1000).toFixed(2),'kW'] : [w.toFixed(0),'W'];
+const socClr = s => s == null ? 'var(--mut)' : s > 50 ? 'var(--ok)' : s > 20 ? 'var(--warn)' : 'var(--bad)';
+
+function norm(d, failed) {
+  const v = num(d[F.voltage]), a = num(d[F.current]);
+  let w = num(d[F.power]); if (w == null && v != null && a != null) w = v * a;
+  let al = d[F.alarm]; if (Array.isArray(al)) al = al.join(', ');
+  if (!al || /^(0|false|none|ok)$/i.test(String(al))) al = '';
+  const title = CFG.TITLE_PRIORITY.map(k => d[F[k]]).find(x => x) || '?';
+
+  const cv = (Array.isArray(d.cell_voltages) ? d.cell_voltages : []).map(num);
+  const valid = cv.filter(x => x != null);
+  const mn = valid.length ? Math.min(...valid) : null, mx = valid.length ? Math.max(...valid) : null;
+  let delta = num(d.delta_cell_voltage); if (delta == null && mn != null) delta = mx - mn;
+  const avgCell = num(d.average_cell_voltage) ?? (valid.length ? valid.reduce((p,c)=>p+c,0)/valid.length : null);
+
+  const temps = [1,2,3,4].map(i => num(d['battery_t' + i]));
+  let n = 4; while (n > 2 && temps[n-1] == null) n--;   // T3/T4 лише якщо є
+
+  return { title, type: d.bms_type || '', v, a, w, ah: num(d[F.remain_ah]), soc: num(d[F.soc]),
+           online: !failed && d[F.connected] !== false, alarm: String(al),
+           cv, mn, mx, delta, avgCell, cycles: num(d.cycle_count),
+           chg: d.charge, dsg: d.discharge, temps: temps.slice(0, n) };
+}
+
+function cells(m) {
+  const [pw, pu] = fxP(m.w);
+  const chg = m.a != null && (CFG.CHARGE_POSITIVE ? m.a > 0 : m.a < 0);
+  const soc = m.soc;
+  return `
+  <div class="cell c-v"><div class="lbl">Volt</div><div class="val num">${fx(m.v,2)}<small>V</small></div></div>
+  <div class="cell c-a ${chg?'chg':''}"><div class="lbl">Amp</div><div class="val num">${fx(m.a,1)}<small>A</small></div></div>
+  <div class="cell c-w"><div class="lbl">Power</div><div class="val num">${pw}<small>${pu}</small></div></div>
+  <div class="cell c-ah"><div class="lbl">Remain</div><div class="val num">${fx(m.ah,1)}<small>Ah</small></div></div>
+  <div class="cell c-soc"><div class="lbl">SOC</div><div class="val num" style="color:${socClr(soc)}">${fx(soc,0)}<small>%</small></div>
+    <div class="bar"><i style="width:${soc==null?0:Math.max(0,Math.min(100,soc))}%;background:${socClr(soc)}"></i></div></div>`;
+}
+
+const chip = (name, on) => `<span class="chip ${on === false ? 'no' : ''}">${name} ${on == null ? '—' : on ? 'ON' : 'OFF'}</span>`;
+const tClr = t => t == null ? '' : t >= 60 ? 'bad-t' : t >= 45 ? 'warn-t' : '';
+const dClr = d => d == null ? '' : d >= 0.05 ? 'bad-t' : d >= 0.02 ? 'warn-t' : 'ok-t';
+
+function details(m) {
+  const cvs = m.cv.map((x, i) => {
+    const c = m.cv.length > 1 && m.mx !== m.mn ? (x === m.mx ? 'hi' : x === m.mn ? 'lo' : '') : '';
+    return `<div class="${c}"><b class="num">${fx(x,3)}</b><span>C${i+1}</span></div>`;
+  }).join('');
+  const tmp = m.temps.map((t, i) =>
+    `<div class="cell"><div class="lbl">T${i+1}</div><div class="val num ${tClr(t)}">${fx(t,0)}<small>°C</small></div></div>`).join('');
+  return `<div class="det">
+    <div class="mos">${chip('CHG', m.chg)}${chip('DSG', m.dsg)}</div>
+    <div class="st">
+      <div class="cell"><div class="lbl">Δ cells</div><div class="val num ${dClr(m.delta)}">${m.delta == null ? '—' : Math.round(m.delta*1000)}<small>mV</small></div></div>
+      <div class="cell"><div class="lbl">Avg cell</div><div class="val num">${fx(m.avgCell,3)}<small>V</small></div></div>
+      <div class="cell"><div class="lbl">Cycles</div><div class="val num">${m.cycles ?? '—'}</div></div>
+    </div>
+    <div class="tmp">${tmp}</div>
+    ${cvs ? `<div class="cv">${cvs}</div>` : ''}
+  </div>`;
+}
+
+function card(m, extra = '') {
+  const alm = m.online ? m.alarm : 'offline';
+  const cls = !m.online ? 'off' : m.alarm ? 'alm' : '';
+  const tag = alm ? `alarm: ${esc(alm)}` : 'OK';
+  const sub = m.type ? `<small>${esc(m.type)}</small>` : '';
+  return `<article class="card ${cls} ${extra}">
+    <div class="head"><div class="title">${esc(m.title)}${sub}</div><span class="tag">${tag}</span></div>
+    <div class="m">${cells(m)}</div>${extra === 'pack' ? '' : details(m)}</article>`;
+}
+
+function aggregate(list) {
+  const on = list.filter(x => x.online), n = on.length;
+  const sum = k => { const a = on.map(x => x[k]).filter(x => x != null); return a.length ? a.reduce((p,c)=>p+c,0) : null; };
+  const avg = k => { const s = sum(k); const c = on.filter(x => x[k] != null).length; return s == null ? null : s / c; };
+  const alarms = on.map(x => x.alarm).filter(Boolean);
+  const off = list.length - n;
+  return { title: CFG.PACK_TITLE, type: '', online: n > 0,
+    v: CFG.PACK_VOLTAGE === 'sum' ? sum('v') : avg('v'),
+    a: sum('a'), w: sum('w'), ah: sum('ah'), soc: avg('soc'),
+    alarm: [off ? `${off} offline` : '', ...alarms].filter(Boolean).join('; '),
+    cnt: `${n}/${list.length} online` };
+}
+
+let LAST = [];
+function render(devs, failed) {
+  if (!failed) LAST = devs;
+  const list = devs.map(d => norm(d, failed));
+  const p = aggregate(list);
+  $('#pack').innerHTML = card(p, 'pack').replace(/<span class="tag">/,
+    `<span class="tag" style="margin-left:auto;margin-right:8px;color:var(--mut)">${p.cnt}</span><span class="tag">`);
+  $('#grid').innerHTML = list.map(m => card(m)).join('');
+}
+
+async function tick() {
+  try {
+    const r = await fetch(CFG.DATA_URL, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    const devs = Array.isArray(j) ? j : Array.isArray(j[F.list]) ? j[F.list] :
+      Object.entries(j).map(([mac, d]) => ({ ...d, [F.mac]: mac }));
+    render(devs, false);
+  } catch (e) {
+    render(LAST, true);
+  }
+  setTimeout(tick, CFG.POLL_MS);
+}
+tick();
+</script>
+</body>
+</html>
