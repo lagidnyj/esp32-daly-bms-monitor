@@ -14,6 +14,21 @@
 
 ---
 
+### ☁️ Повна інтеграція з Micro IoT Cloud
+
+Цей проект має **повну інтеграцію** з хмарним сервісом **[Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud)** — відкритого IoT рішення для промислового та домашнього IoT.
+
+**Можливості інтеграції:**
+- 🔄 Real-time синхронізація даних BMS
+- 📊 Історичні графіки та аналітика
+- 🔔 Сповіщення та алерти
+- 📱 Мобільний доступ
+- 📈 Детальна статистика
+
+👉 **[Детальніше про інтеграцію](./doc/README.md#cloud-integration)**
+
+---
+
 ## 📋 Українська
 
 ### Про проект
@@ -22,7 +37,7 @@
 
 - 🔌 **Bluetooth Low Energy (BLE)** — прямий зв'язок з BMS
 - 📡 **Wi-Fi** — передача даних по мережі
-- ☁️ **Cloud Integration** — відправка метрики на сервер
+- ☁️ **Cloud Integration** — відправка метрики на сервер ([Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud))
 - 📊 **Web Dashboard** — веб-інтерфейс для перегляду даних
 - 📱 **JSON API** — простий API для інтеграцій
 
@@ -44,7 +59,7 @@
 
 ✅ **Мережа:**
 - Wi-Fi та MQTT
-- Хмарні сервіси (Blynk, Home Assistant, тощо)
+- Хмарні сервіси ([Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud), Blynk, Home Assistant)
 - JSON API для інтеграцій
 
 ✅ **Користувацькі інтерфейси:**
@@ -320,6 +335,12 @@ Log messages: [tag] message format
 
 Проект легко інтегрується з:
 
+- **🔗 [Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud)** — Повна інтеграція з відкритим IoT сервісом ⭐ **РЕКОМЕНДУЄТЬСЯ**
+  - Real-time синхронізація даних
+  - Аналітика та історія
+  - Мобільний доступ
+  - Сповіщення та алерти
+
 - 📊 **Home Assistant** — через MQTT або HTTP
 - 🎮 **Blynk** — IoT платформа
 - 📉 **InfluxDB** — база даних часових рядів
@@ -362,7 +383,7 @@ MIT License — див. [LICENSE](LICENSE)
 **Key Features:**
 - 🔌 Bluetooth Low Energy (BLE) connectivity
 - 📡 Wi-Fi integration
-- ☁️ Cloud services support (Blynk, Home Assistant, MQTT)
+- ☁️ Cloud services support — **Full integration with [Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud)** ⭐
 - 📊 Web dashboard with real-time monitoring
 - 📱 JSON API for integrations
 - 🔧 Flexible device configuration with names and IDs
@@ -384,6 +405,10 @@ static const struct BmsDeviceConfig BMS_DEVICES[] = {
 ```
 
 4. **Upload to ESP32 and monitor serial output**
+
+### Cloud Integration
+
+This project features **full integration** with **[Micro-IoT-Cloud](https://github.com/lagidnyj/Micro-IoT-Cloud)** — an open-source IoT solution for industrial and home IoT applications.
 
 ### Documentation
 
