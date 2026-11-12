@@ -17,6 +17,13 @@ repository under `firmware/daly-profile/`.
    `firmware/daly-profile/web/style.css`. Keep the HTML and CSS filenames; the
    root page will then open the lite UI.
 
+## BLE diagnostics
+
+The sketch requests a BLE MTU of 517 and prints the negotiated MTU after
+connecting. It logs raw BLE TX/RX bytes with millisecond timestamps to Serial
+at 115200 baud. Capture the output around the `0x95` request to inspect cell
+voltage response frames. The BMS may negotiate a smaller MTU.
+
 ## Micro IoT Cloud
 
 Cloud reporting is disabled by default. Copy `config.json.example` to

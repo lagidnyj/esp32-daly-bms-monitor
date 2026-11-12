@@ -2,7 +2,13 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Update.h>
 #include <WebServer.h>
+#include <string.h>
+
+#include "BmsConfig.h"
+#include "NetworkService.h"
+#include "WebAssets.h"
 
 namespace {
 WebServer server(80);
@@ -10,6 +16,56 @@ File uploadFile;
 bool uploadFailed = false;
 String uploadError;
 String telemetryJson = "{}";
+bool otaUploadStarted = false;
+bool otaUploadFailed = false;
+bool otaUploadFinished = false;
+String otaUploadError;
+
+constexpr char OTA_USERNAME[] = "vendor";
+constexpr char OTA_PASSWORD_PLACEHOLDER[] = "CHANGE_ME_OTA_PASSWORD";
+
+bool isOtaPasswordConfigured() {
+  return OTA_PASSWORD != nullptr && strlen(OTA_PASSWORD) >= 16 &&
+         strcmp(OTA_PASSWORD, OTA_PASSWORD_PLACEHOLDER) != 0;
+}
+
+bool requireOtaAuthentication() {
+  if (!isOtaPasswordConfigured()) {
+    server.send(503, "text/plain; charset=utf-8",
+                "OTA is disabled. Set OTA_PASSWORD in BmsConfig.h to a "
+                "non-placeholder value of at least 16 characters.");
+    return false;
+  }
+  if (!server.authenticate(OTA_USERNAME, OTA_PASSWORD)) {
+    server.requestAuthentication(BASIC_AUTH, "ESP32 OTA");
+    return false;
+  }
+  return true;
+}
+
+bool installDefaultFileIfMissing(const char* path, const char* content,
+                                 size_t size) {
+  if (LittleFS.exists(path)) return true;
+
+  File file = LittleFS.open(path, "w");
+  if (!file) {
+    Serial.printf("Could not create default web file %s.\n", path);
+    return false;
+  }
+
+  const size_t written = file.write(
+      reinterpret_cast<const uint8_t*>(content), size);
+  file.close();
+  if (written != size) {
+    LittleFS.remove(path);
+    Serial.printf("Could not fully write default web file %s.\n", path);
+    return false;
+  }
+
+  Serial.printf("Installed default web file %s (%u bytes).\n", path,
+                static_cast<unsigned>(size));
+  return true;
+}
 
 String htmlEscape(const String& value) {
   String escaped;
@@ -128,7 +184,8 @@ void handleFileList() {
   page += F("</table><h2>Upload files</h2><form method='post' action='/fs/upload' "
             "enctype='multipart/form-data'><input type='file' name='file' required>"
             "<button type='submit'>Upload</button></form>"
-            "<p>Only one file can be uploaded at a time. <a href='/'>Home</a></p>"
+            "<p>Only one file can be uploaded at a time. <a href='/'>Home</a> | "
+            "<a href='/wifi'>Wi-Fi setup</a> | <a href='/update'>Firmware update</a></p>"
             "</body></html>");
   server.send(200, "text/html; charset=utf-8", page);
 }
@@ -145,6 +202,133 @@ void handleRoot() {
     return;
   }
   handleFileList();
+}
+
+void handleWifiSetup() {
+  String page = F(
+      "<!doctype html><html><head><meta name='viewport' content='width=device-width,"
+      "initial-scale=1'><title>Wi-Fi setup</title><style>"
+      "body{font:16px sans-serif;max-width:560px;margin:2em auto;padding:0 1em}"
+      "label,input,button{display:block;width:100%;box-sizing:border-box;margin:.6em 0}"
+      "input,button{padding:.7em}</style></head><body><h1>Wi-Fi setup</h1>");
+  if (NetworkService::isProvisioning()) {
+    page += F("<p>Setup access point is active. Open this page at "
+              "<code>http://192.168.4.1/wifi</code>.</p>"
+              "<p>The device restarts if setup is not completed within five minutes.</p>");
+  }
+  page += F(
+      "<form method='post' action='/wifi/save'>"
+      "<label for='ssid'>Wi-Fi name (SSID)</label>"
+      "<input id='ssid' name='ssid' maxlength='32' required autocomplete='off'>"
+      "<label for='password'>Wi-Fi password</label>"
+      "<input id='password' name='password' type='password' maxlength='63' "
+      "autocomplete='new-password'>"
+      "<p>Leave the password empty only for an open Wi-Fi network. Saving "
+      "restarts the device.</p><button type='submit'>Save and restart</button>"
+      "</form><p><a href='/'>Home</a> | <a href='/fs'>Files</a></p>"
+      "</body></html>");
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+void handleWifiSetupSave() {
+  String error;
+  if (!NetworkService::saveWifiCredentials(server.arg("ssid"),
+                                            server.arg("password"), error)) {
+    server.send(400, "text/plain; charset=utf-8", error);
+    return;
+  }
+  server.send(200, "text/html; charset=utf-8",
+              "<!doctype html><html><body><p>Wi-Fi credentials saved. "
+              "The device is restarting.</p></body></html>");
+}
+
+void handleOtaPage() {
+  if (!requireOtaAuthentication()) return;
+
+  const String page = F(
+      "<!doctype html><html><head><meta name='viewport' content='width=device-width,"
+      "initial-scale=1'><title>Firmware update</title><style>"
+      "body{font:16px sans-serif;max-width:560px;margin:2em auto;padding:0 1em}"
+      "input,button{display:block;width:100%;box-sizing:border-box;margin:.8em 0;padding:.7em}"
+      "</style></head><body><h1>Firmware update</h1>"
+      "<p>Choose an ESP32 firmware .bin file. Do not disconnect power during update.</p>"
+      "<form method='post' action='/update' enctype='multipart/form-data'>"
+      "<input type='file' name='firmware' accept='.bin' required>"
+      "<button type='submit'>Upload and install</button></form>"
+      "<p><a href='/'>Home</a> | <a href='/fs'>Files</a></p>"
+      "</body></html>");
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+void handleOtaUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUploadStarted = false;
+    otaUploadFailed = false;
+    otaUploadFinished = false;
+    otaUploadError = "";
+    if (!isOtaPasswordConfigured()) {
+      otaUploadFailed = true;
+      otaUploadError = "OTA password is not configured.";
+      return;
+    }
+    if (!server.authenticate(OTA_USERNAME, OTA_PASSWORD)) {
+      otaUploadFailed = true;
+      otaUploadError = "OTA authentication failed.";
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      otaUploadFailed = true;
+      otaUploadError = "Could not start firmware update.";
+      Update.printError(Serial);
+      return;
+    }
+    otaUploadStarted = true;
+    Serial.printf("OTA upload started: %s\n", upload.filename.c_str());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otaUploadStarted && !otaUploadFailed) {
+      const size_t written = Update.write(upload.buf, upload.currentSize);
+      if (written != upload.currentSize) {
+        otaUploadFailed = true;
+        otaUploadError = "Firmware write failed.";
+        Update.printError(Serial);
+        Update.abort();
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUploadStarted && !otaUploadFailed) {
+      if (Update.end(true)) {
+        otaUploadFinished = true;
+        Serial.printf("OTA upload completed: %u bytes.\n",
+                      static_cast<unsigned>(upload.totalSize));
+      } else {
+        otaUploadFailed = true;
+        otaUploadError = "Firmware image validation or finalization failed.";
+        Update.printError(Serial);
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (otaUploadStarted) Update.abort();
+    otaUploadStarted = false;
+    otaUploadFailed = true;
+    otaUploadError = "Firmware upload was aborted.";
+  }
+}
+
+void handleOtaUploadComplete() {
+  if (!requireOtaAuthentication()) return;
+  if (otaUploadFailed || !otaUploadFinished) {
+    const String error = otaUploadError.length()
+                             ? otaUploadError
+                             : "Firmware update did not complete.";
+    server.send(400, "text/plain; charset=utf-8", error);
+    return;
+  }
+
+  server.send(200, "text/plain; charset=utf-8",
+              "Firmware updated successfully. Restarting device.");
+  delay(1000);
+  ESP.restart();
 }
 
 void handleTelemetry() {
@@ -297,7 +481,16 @@ void handleFileUploadComplete() {
 
 namespace FileManager {
 void begin() {
+  installDefaultFileIfMissing("/index.html", WebAssets::BMS_INDEX_HTML,
+                              sizeof(WebAssets::BMS_INDEX_HTML) - 1);
+  installDefaultFileIfMissing("/bms.css", WebAssets::BMS_STYLE_CSS,
+                              sizeof(WebAssets::BMS_STYLE_CSS) - 1);
+
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/wifi", HTTP_GET, handleWifiSetup);
+  server.on("/wifi/save", HTTP_POST, handleWifiSetupSave);
+  server.on("/update", HTTP_GET, handleOtaPage);
+  server.on("/update", HTTP_POST, handleOtaUploadComplete, handleOtaUpload);
   server.on("/data", HTTP_GET, handleTelemetry);
   server.on("/fdata", HTTP_GET, handleTelemetry);
   server.on("/fs", HTTP_GET, handleFileList);

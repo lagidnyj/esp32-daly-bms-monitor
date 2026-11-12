@@ -26,6 +26,19 @@ static std::string lc(std::string value) {
   return value;
 }
 
+// Extract last 4 characters of MAC address as device ID (format: 1122)
+static std::string extractIdFromMac(const std::string& mac) {
+  if (mac.length() >= 5) {
+    std::string id;
+    id += mac[mac.length() - 5];
+    id += mac[mac.length() - 4];
+    id += mac[mac.length() - 2];
+    id += mac[mac.length() - 1];
+    return id;
+  }
+  return "";
+}
+
 static const char* hint(int rc) {
   switch (rc) {
     case 0:     return "no error code (timeout or refused)";
@@ -137,8 +150,15 @@ bool pollOne(Bms& bms) {
     NimBLEDevice::deleteClient(client);
     return false;
   }
-  Serial.printf("[%s] connected in %lu ms, MTU %u\n", bms.dev.mac.c_str(),
-                (unsigned long)(millis() - connectStart), (unsigned)client->getMTU());
+  Serial.printf("[%s] connected in %lu ms\n", bms.dev.mac.c_str(),
+                (unsigned long)(millis() - connectStart));
+  if (!client->exchangeMTU()) {
+    const int error = client->getLastError();
+    Serial.printf("[%s] MTU exchange request failed rc=%d; continuing at MTU %u\n",
+                  bms.dev.mac.c_str(), error, (unsigned)client->getMTU());
+  } else {
+    Serial.printf("[%s] MTU exchange request sent\n", bms.dev.mac.c_str());
+  }
 
   bool good = false;
   NimBLERemoteService* service = client->getService(SVC_UUID);
@@ -155,6 +175,8 @@ bool pollOne(Bms& bms) {
       Serial.println("  subscribe FAILED");
     } else {
       delay(300);
+      Serial.printf("[%s] current MTU %u\n", bms.dev.mac.c_str(),
+                    (unsigned)client->getMTU());
       parser.resetResponses();
 
       static const uint8_t commands[] = {0x94, 0x90, 0x91, 0x92, 0x93, 0x98};
@@ -213,8 +235,10 @@ void doScan() {
   NimBLEScanResults results = scan->getResults(SCAN_MS, false);
   for (int i = 0; i < (int)results.getCount(); i++) {
     const NimBLEAdvertisedDevice* device = results.getDevice(i);
-    Found found(device->getAddress(), lc(device->getAddress().toString()),
-                device->haveName() ? device->getName() : std::string(), device->getRSSI(),
+    std::string mac = lc(device->getAddress().toString());
+    std::string id = extractIdFromMac(mac);
+    Found found(device->getAddress(), mac,
+                device->haveName() ? device->getName() : std::string(), id, device->getRSSI(),
                 device->isAdvertisingService(NimBLEUUID(SVC_UUID)));
     Serial.printf("  %s  rssi %4d  type %d  %-20s %s\n", found.mac.c_str(), found.rssi,
                   (int)device->getAddress().getType(), found.name.c_str(),
@@ -227,12 +251,18 @@ void doScan() {
 
 void buildTargets() {
   bms.clear();
-  if (BMS_MACS[0]) {
-    for (int i = 0; BMS_MACS[i] && bms.size() < MAX_BMS; i++) {
-      const std::string mac = lc(BMS_MACS[i]);
+  if (BMS_DEVICES[0].mac != nullptr) {
+    // Config-based mode: use configured devices
+    for (int i = 0; BMS_DEVICES[i].mac != nullptr && bms.size() < MAX_BMS; i++) {
+      const std::string cfgMac = lc(BMS_DEVICES[i].mac);
+      const std::string cfgId = BMS_DEVICES[i].id ? std::string(BMS_DEVICES[i].id) : extractIdFromMac(cfgMac);
+      const std::string cfgName = BMS_DEVICES[i].name ? std::string(BMS_DEVICES[i].name) : std::string();
+      
       bool foundTarget = false;
       for (auto& device : seen) {
-        if (device.mac == mac) {
+        if (device.mac == cfgMac) {
+          device.id = cfgId;
+          device.name = cfgName;
           bms.emplace_back(device);
           foundTarget = true;
           break;
@@ -240,11 +270,13 @@ void buildTargets() {
       }
       if (!foundTarget) {
         Serial.printf("[cfg] %s NOT seen in scan (busy with phone? out of range?) - trying anyway\n",
-                      mac.c_str());
-        bms.emplace_back(Found(NimBLEAddress(mac, BLE_ADDR_PUBLIC), mac, "", 0, false));
+                      cfgMac.c_str());
+        Found dev(NimBLEAddress(cfgMac, BLE_ADDR_PUBLIC), cfgMac, cfgName, cfgId, 0, false);
+        bms.emplace_back(dev);
       }
     }
   } else {
+    // Auto-scan mode: discover devices by name prefix or FFF0 service
     for (auto& device : seen) {
       if (bms.size() >= MAX_BMS) break;
       bool knownName = false;
@@ -258,4 +290,84 @@ void buildTargets() {
     }
   }
   Serial.printf("[cfg] %u BMS target(s)\n", (unsigned)bms.size());
+}
+
+void scanAndUpdateTargets() {
+  doScan();
+  size_t added = 0;
+  size_t updated = 0;
+
+  if (BMS_DEVICES[0].mac != nullptr) {
+    // Config-based mode
+    for (int i = 0; BMS_DEVICES[i].mac != nullptr; i++) {
+      const std::string cfgMac = lc(BMS_DEVICES[i].mac);
+      const std::string cfgId = BMS_DEVICES[i].id ? std::string(BMS_DEVICES[i].id) : extractIdFromMac(cfgMac);
+      const std::string cfgName = BMS_DEVICES[i].name ? std::string(BMS_DEVICES[i].name) : std::string();
+      
+      for (const auto& device : seen) {
+        if (device.mac != cfgMac) continue;
+
+        bool alreadyTracked = false;
+        for (auto& target : bms) {
+          if (target.dev.mac == cfgMac) {
+            target.dev = device;
+            target.dev.id = cfgId;
+            target.dev.name = cfgName;
+            alreadyTracked = true;
+            ++updated;
+            break;
+          }
+        }
+        if (!alreadyTracked) {
+          if (bms.size() < MAX_BMS) {
+            Found dev = device;
+            dev.id = cfgId;
+            dev.name = cfgName;
+            bms.emplace_back(dev);
+            ++added;
+          } else {
+            Serial.printf("[cfg] target limit (%u) reached; ignoring %s\n",
+                          static_cast<unsigned>(MAX_BMS), device.mac.c_str());
+          }
+        }
+        break;
+      }
+    }
+  } else {
+    // Auto-scan mode
+    for (const auto& device : seen) {
+      bool knownName = false;
+      for (const char* prefix : BMS_NAME_PREFIXES) {
+        if (device.name.rfind(prefix, 0) == 0) {
+          knownName = true;
+          break;
+        }
+      }
+      if (!knownName && !device.fff0) continue;
+
+      bool alreadyTracked = false;
+      for (auto& target : bms) {
+        if (target.dev.mac == device.mac) {
+          target.dev = device;
+          alreadyTracked = true;
+          ++updated;
+          break;
+        }
+      }
+      if (alreadyTracked) continue;
+      if (bms.size() >= MAX_BMS) {
+        Serial.printf("[cfg] target limit (%u) reached; ignoring %s\n",
+                      static_cast<unsigned>(MAX_BMS), device.mac.c_str());
+        continue;
+      }
+      bms.emplace_back(device);
+      ++added;
+      Serial.printf("[cfg] discovered new BMS %s (%s)\n", device.mac.c_str(),
+                    device.name.c_str());
+    }
+  }
+
+  Serial.printf("[cfg] rescan complete: %u target(s), %u added, %u refreshed\n",
+                static_cast<unsigned>(bms.size()), static_cast<unsigned>(added),
+                static_cast<unsigned>(updated));
 }

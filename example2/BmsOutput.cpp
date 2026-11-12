@@ -110,16 +110,25 @@ void appendAlertsJson(String& json, const Bms& device) {
 }
 
 String buildJson(const std::vector<Bms>& bms) {
-  const uint32_t now = millis();
   String json = "{";
   for (size_t i = 0; i < bms.size(); i++) {
     const Bms& device = bms[i];
     if (i) json += ',';
-    const bool connected = device.lastOk != 0 &&
-                           now - device.lastOk < POLL_INTERVAL_MS * 3UL;
+    const bool connected = device.lastOk != 0 && device.consecutiveFailures < 3;
     json += "\"" + String(device.dev.mac.c_str()) + "\":{";
     json += "\"bms_type\":\"DALY A5\"";
     json += ",\"connected\":" + String(connected ? "true" : "false");
+    
+    // Add id if available (last 4 chars of MAC or from config)
+    if (!device.dev.id.empty()) {
+      json += ",\"id\":\"" + String(device.dev.id.c_str()) + "\"";
+    }
+    
+    // Add name if available (from config)
+    if (!device.dev.name.empty()) {
+      json += ",\"name\":\"" + String(device.dev.name.c_str()) + "\"";
+    }
+    
     json += ",\"battery_voltage\":" + String(device.v, 1);
     json += ",\"battery_power\":" + String(device.v * device.a, 1);
     json += ",\"charge_current\":" + String(device.a, 1);

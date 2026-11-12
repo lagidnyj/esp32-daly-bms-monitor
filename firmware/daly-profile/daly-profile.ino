@@ -22,6 +22,7 @@ static constexpr uint32_t CLOUD_RETRY_INTERVAL_MS = 30000;
 static constexpr uint32_t SCAN_DURATION_MS = 8000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
 static constexpr uint32_t POLL_INTERVAL_MS = 10000;
+static constexpr uint16_t BLE_MTU = 517;
 static constexpr uint8_t CELL_CAPACITY = 48;
 
 static constexpr char SERVICE_UUID[] = "0000fff0-0000-1000-8000-00805f9b34fb";
@@ -248,6 +249,13 @@ static void processNotifications() {
   if (incomingLength == 0) {
     return;
   }
+  Serial.printf("[%lu ms] RX (%u):", static_cast<unsigned long>(millis()),
+                static_cast<unsigned>(incomingLength));
+  for (size_t i = 0; i < incomingLength; ++i) {
+    Serial.printf(" %02X", incoming[i]);
+  }
+  Serial.println();
+
   if (parseLength + incomingLength > sizeof(parseBuffer)) {
     parseLength = 0;
   }
@@ -286,6 +294,11 @@ static bool sendCommand(uint8_t command) {
     sum += frame[i];
   }
   frame[12] = sum;
+  Serial.printf("[%lu ms] TX:", static_cast<unsigned long>(millis()));
+  for (size_t i = 0; i < sizeof(frame); ++i) {
+    Serial.printf(" %02X", frame[i]);
+  }
+  Serial.println();
   receivedCommand[command] = false;
   return writeCharacteristic->writeValue(frame, sizeof(frame), writeCharacteristic->canWrite());
 }
@@ -340,13 +353,14 @@ static bool pollBms() {
   }
   client->setConnectTimeout(CONNECT_TIMEOUT_MS);
   Serial.printf("Connecting to %s (addrType %u)...\n", BMS_MAC, bmsAddress.getType());
-  if (!client->connect(bmsAddress, true, false, false)) {
+  if (!client->connect(bmsAddress, true, false, true)) {
     Serial.printf("DALY connection failed: rc=%d\n", client->getLastError());
     NimBLEDevice::deleteClient(client);
     client = nullptr;
     return false;
   }
-  Serial.println("BLE connected.");
+  Serial.printf("BLE connected. Negotiated MTU: %u\n",
+                static_cast<unsigned>(client->getMTU()));
 
   NimBLERemoteService* service = client->getService(SERVICE_UUID);
   NimBLERemoteCharacteristic* notifyCharacteristic =
@@ -632,6 +646,10 @@ void setup() {
   server.begin();
 
   NimBLEDevice::init("DALY-Monitor");
+  if (!NimBLEDevice::setMTU(BLE_MTU)) {
+    Serial.printf("Could not set local BLE MTU to %u.\n",
+                  static_cast<unsigned>(BLE_MTU));
+  }
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   hasAddress = scanForBms();
   nextPollAt = millis();
