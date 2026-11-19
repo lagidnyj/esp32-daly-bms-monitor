@@ -1,12 +1,15 @@
 #include "FileManager.h"
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <Update.h>
 #include <WebServer.h>
 #include <string.h>
 
 #include "BmsConfig.h"
+#include "BmsBle.h"
+#include "BmsModbusControl.h"
 #include "NetworkService.h"
 #include "WebAssets.h"
 
@@ -336,6 +339,121 @@ void handleTelemetry() {
   server.send(200, "application/json", telemetryJson);
 }
 
+void sendControlError(int statusCode, const char* message) {
+  StaticJsonDocument<128> response;
+  response["error"] = message;
+  String body;
+  serializeJson(response, body);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(statusCode, "application/json", body);
+}
+
+enum class ControlWriteKind { Mosfet, Soc, Sleep, RatedCapacity };
+
+void handleQueueControlWrite(ControlWriteKind kind) {
+#if !ENABLE_EXPERIMENTAL_MODBUS_WRITES
+  sendControlError(503, "Experimental Modbus writes are disabled in BmsConfig.h.");
+  return;
+#endif
+  if (!requireOtaAuthentication()) return;
+
+  StaticJsonDocument<192> request;
+  if (deserializeJson(request, server.arg("plain")) ||
+      !request["mac"].is<const char*>() ||
+      !request["register"].is<int>() || !request["value"].is<uint32_t>() ||
+      (request.containsKey("verify") && !request["verify"].is<bool>())) {
+    sendControlError(400, "Expected mac, register, value, and optional verify.");
+    return;
+  }
+
+  const char* mac = request["mac"].as<const char*>();
+  const int reg = request["register"].as<int>();
+  const uint32_t value = request["value"].as<uint32_t>();
+  const bool verifyResult = request["verify"] | false;
+  if (!hasBmsTarget(mac)) {
+    sendControlError(404, "MAC does not match a configured or discovered BMS.");
+    return;
+  }
+  bool valid = false;
+  switch (kind) {
+    case ControlWriteKind::Mosfet:
+      valid = (reg == 0x0121 || reg == 0x0122) && value <= 1;
+      break;
+    case ControlWriteKind::Soc:
+      valid = reg == 0x0116 && value <= 1000;
+      break;
+    case ControlWriteKind::Sleep:
+      valid = reg == 0x0115 && value >= 1 && value <= 6552;
+      break;
+    case ControlWriteKind::RatedCapacity:
+      valid = reg == 0x0109 && value >= 1;
+      break;
+  }
+  if (!valid) {
+    sendControlError(400, "Invalid register or value for this control.");
+    return;
+  }
+
+  uint32_t commandId = 0;
+  if (!BmsModbusControl::enqueue(mac, static_cast<uint16_t>(reg),
+                                 value, verifyResult,
+                                 commandId)) {
+    sendControlError(429, "Command queue is full or the MAC is invalid.");
+    return;
+  }
+
+  StaticJsonDocument<96> response;
+  response["id"] = commandId;
+  response["state"] = BmsModbusControl::stateName(BmsModbusControl::CommandState::Queued);
+  String body;
+  serializeJson(response, body);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(202, "application/json", body);
+}
+
+void handleQueueMosfetWrite() {
+  handleQueueControlWrite(ControlWriteKind::Mosfet);
+}
+
+void handleQueueSocWrite() {
+  handleQueueControlWrite(ControlWriteKind::Soc);
+}
+
+void handleQueueSleepWrite() {
+  handleQueueControlWrite(ControlWriteKind::Sleep);
+}
+
+void handleQueueRatedCapacityWrite() {
+  handleQueueControlWrite(ControlWriteKind::RatedCapacity);
+}
+
+void handleMosfetWriteStatus() {
+  if (!requireOtaAuthentication()) return;
+
+  const long parsedId = server.arg("id").toInt();
+  if (parsedId <= 0) {
+    sendControlError(400, "A positive command id is required.");
+    return;
+  }
+
+  BmsModbusControl::Result result = {};
+  if (!BmsModbusControl::getResult(static_cast<uint32_t>(parsedId), result)) {
+    sendControlError(404, "Command id was not found.");
+    return;
+  }
+
+  StaticJsonDocument<160> response;
+  response["id"] = result.id;
+  response["state"] = BmsModbusControl::stateName(result.state);
+  response["register"] = result.reg;
+  response["requested"] = result.requestedValue;
+  if (result.hasActualValue) response["actual"] = result.actualValue;
+  String body;
+  serializeJson(response, body);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", body);
+}
+
 String contentTypeForPath(const String& path) {
   if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html; charset=utf-8";
   if (path.endsWith(".css")) return "text/css; charset=utf-8";
@@ -493,6 +611,11 @@ void begin() {
   server.on("/update", HTTP_POST, handleOtaUploadComplete, handleOtaUpload);
   server.on("/data", HTTP_GET, handleTelemetry);
   server.on("/fdata", HTTP_GET, handleTelemetry);
+  server.on("/api/control/mosfet", HTTP_POST, handleQueueMosfetWrite);
+  server.on("/api/control/soc", HTTP_POST, handleQueueSocWrite);
+  server.on("/api/control/sleep", HTTP_POST, handleQueueSleepWrite);
+  server.on("/api/control/rated-capacity", HTTP_POST, handleQueueRatedCapacityWrite);
+  server.on("/api/control/status", HTTP_GET, handleMosfetWriteStatus);
   server.on("/fs", HTTP_GET, handleFileList);
   server.on("/fs/view", HTTP_GET, handleFileView);
   server.on("/fs/download", HTTP_GET, handleFileDownload);

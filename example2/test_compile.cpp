@@ -1,3 +1,4 @@
+#ifndef ARDUINO
 // Simple compile test
 #include "BmsConfig.h"
 #include "BmsTypes.h"
@@ -17,3 +18,4 @@ int main() {
     
     return 0;
 }
+#endif

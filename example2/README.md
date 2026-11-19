@@ -88,6 +88,23 @@ Internet Explorer is not supported. Older or embedded browsers may load the
 page but fail to run its telemetry refresh script. The CSS has a `100vh`
 fallback for browsers that do not support the newer `100dvh` viewport unit.
 
+## Experimental BMS control
+
+Modbus writes are disabled by default. To test them on a compatible BMS,
+set `ENABLE_EXPERIMENTAL_MODBUS_WRITES` to `1` and configure `OTA_PASSWORD`
+as described below. Upload `control.html` to LittleFS through `/fs`, then
+open `/control.html` and select the target by its full MAC address. The
+control API uses the same HTTP Basic Authentication as OTA; use only a
+trusted network because HTTP does not encrypt credentials or commands.
+
+The page supports charge/discharge MOSFETs, SOC, rated capacity and sleep
+time, with optional readback. Rated capacity is written in milliamp-hours
+to registers `0x0109..0x010A`; it does not change actual capacity. Sleep
+time accepts 10 to 65520 seconds in 10-second increments; the meaning of
+65520 as a never-sleep value has not been verified on the device. Restart
+is not implemented because its command is not yet confirmed. Test the new
+capacity and sleep controls on a safe setup before relying on them.
+
 ## Firmware updates
 
 Open `http://<device-ip>/update` and authenticate with the username `vendor`

@@ -32,6 +32,9 @@ static const char* const OTA_PASSWORD = "CHANGE_ME_OTA_PASSWORD";
 #define CONN_MIN          24
 #define CONN_MAX          40
 #define BLE_MTU           123
+#define DALY_MODBUS_BLE_REQUEST_ADDRESS 0x81
+#define DALY_MODBUS_BLE_RESPONSE_ADDRESS 0x51
+#define ENABLE_EXPERIMENTAL_MODBUS_WRITES 0
 #define VERBOSE           1  // 1 = print raw BLE commands and response frames
 #define PRINT_JSON        1  // 1 = print telemetry JSON to Serial
 

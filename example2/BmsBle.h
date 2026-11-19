@@ -9,3 +9,4 @@ void doScan();
 void buildTargets();
 void scanAndUpdateTargets();
 bool pollOne(Bms& bms);
+bool hasBmsTarget(const char* mac);

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "BmsConfig.h"
+#include "BmsModbusControl.h"
 #include "DalyParser.h"
 
 static std::vector<Found> seen;
@@ -17,8 +18,19 @@ static uint8_t notifyBuffer[512];
 static volatile size_t notifyLength = 0;
 static portMUX_TYPE notifyMux = portMUX_INITIALIZER_UNLOCKED;
 
+static std::string lc(std::string value);
+
 std::vector<Bms>& bmsDevices() {
   return bms;
+}
+
+bool hasBmsTarget(const char* mac) {
+  if (mac == nullptr) return false;
+  const std::string targetMac = lc(mac);
+  for (const Bms& device : bms) {
+    if (lc(device.dev.mac) == targetMac) return true;
+  }
+  return false;
 }
 
 static std::string lc(std::string value) {
@@ -70,7 +82,10 @@ static void pump() {
   memcpy(temp, notifyBuffer, length);
   notifyLength = 0;
   portEXIT_CRITICAL(&notifyMux);
-  parser.feed(temp, length);
+  for (size_t offset = 0; offset < length; offset += 128) {
+    const size_t remaining = length - offset;
+    parser.feed(temp + offset, remaining < 128 ? remaining : 128);
+  }
 }
 
 static void clearNotifyBuffer() {
@@ -98,6 +113,170 @@ static bool sendCmd(NimBLERemoteCharacteristic* writeCharacteristic, uint8_t com
   parser.clearCommand(command);
   if (VERBOSE) Serial.printf("  -> %02X\n", command);
   return writeCharacteristic->writeValue(packet, 13, writeCharacteristic->canWrite());
+}
+
+static size_t takeNotifyData(uint8_t* destination, size_t capacity) {
+  portENTER_CRITICAL(&notifyMux);
+  size_t length = notifyLength;
+  if (length > capacity) length = capacity;
+  memcpy(destination, notifyBuffer, length);
+  if (length < notifyLength) {
+    memmove(notifyBuffer, notifyBuffer + length, notifyLength - length);
+  }
+  notifyLength -= length;
+  portEXIT_CRITICAL(&notifyMux);
+  return length;
+}
+
+static bool waitModbusResponse(uint8_t function, size_t expectedLength,
+                               uint32_t timeoutMs, uint8_t* response,
+                               size_t& responseLength) {
+  uint8_t accumulated[64] = {};
+  size_t accumulatedLength = 0;
+  uint8_t incoming[512];
+  const uint32_t startedAt = millis();
+
+  while (millis() - startedAt < timeoutMs) {
+    const size_t incomingLength = takeNotifyData(incoming, sizeof(incoming));
+    if (incomingLength > 0) {
+      for (size_t i = 0; i < incomingLength; i++) {
+        if (accumulatedLength == sizeof(accumulated)) {
+          memmove(accumulated, accumulated + 1, sizeof(accumulated) - 1);
+          accumulatedLength--;
+        }
+        accumulated[accumulatedLength++] = incoming[i];
+
+        for (size_t start = 0; start + 2 <= accumulatedLength; start++) {
+          if (accumulated[start] != DALY_MODBUS_BLE_RESPONSE_ADDRESS) continue;
+          const bool exception = accumulated[start + 1] == (function | 0x80);
+          if (accumulated[start + 1] != function && !exception) continue;
+          const size_t candidateLength = exception ? 5 : expectedLength;
+          if (start + candidateLength > accumulatedLength ||
+              !BmsModbusControl::hasValidCrc(accumulated + start, candidateLength)) {
+            continue;
+          }
+          memcpy(response, accumulated + start, candidateLength);
+          responseLength = candidateLength;
+          return true;
+        }
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+static void logModbusFrame(const char* targetMac, const char* direction,
+                           const uint8_t* frame, size_t length) {
+  if (!VERBOSE) return;
+  Serial.printf("[%s] Modbus %s", targetMac, direction);
+  for (size_t i = 0; i < length; i++) Serial.printf(" %02X", frame[i]);
+  Serial.println();
+}
+
+static void processQueuedModbusWrites(
+    const char* targetMac, NimBLERemoteCharacteristic* writeCharacteristic) {
+  BmsModbusControl::Command command = {};
+  while (BmsModbusControl::takeNextFor(targetMac, command)) {
+    uint8_t request[BmsModbusControl::WRITE_UINT32_FRAME_LENGTH];
+    uint8_t response[9] = {};
+    size_t responseLength = 0;
+    const bool isCapacity = command.reg == 0x0109;
+    const uint8_t writeFunction = isCapacity ? 0x10 : 0x06;
+    const size_t requestLength = isCapacity ? BmsModbusControl::WRITE_UINT32_FRAME_LENGTH
+                                            : BmsModbusControl::FRAME_LENGTH;
+    if (isCapacity) {
+      BmsModbusControl::buildWriteUint32(
+          DALY_MODBUS_BLE_REQUEST_ADDRESS, command.reg, command.value, request);
+    } else {
+      BmsModbusControl::buildWriteSingleRegister(
+          DALY_MODBUS_BLE_REQUEST_ADDRESS, command.reg,
+          static_cast<uint16_t>(command.value), request);
+    }
+
+    logModbusFrame(targetMac, "->", request, requestLength);
+    clearNotifyBuffer();
+    if (!writeCharacteristic->writeValue(request, requestLength,
+                                         writeCharacteristic->canWrite())) {
+      Serial.printf("[%s] Modbus 0x%02X BLE write failed (job %lu)\n", targetMac, writeFunction,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+
+    if (!waitModbusResponse(writeFunction, BmsModbusControl::FRAME_LENGTH, 1500, response,
+                            responseLength)) {
+      Serial.printf("[%s] Modbus 0x%02X response timeout (job %lu)\n", targetMac, writeFunction,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+    logModbusFrame(targetMac, "<-", response, responseLength);
+    const bool matched = isCapacity
+        ? BmsModbusControl::matchesWriteUint32Response(
+              request, response, responseLength, DALY_MODBUS_BLE_RESPONSE_ADDRESS)
+        : BmsModbusControl::matchesWriteResponse(
+              request, response, responseLength, DALY_MODBUS_BLE_RESPONSE_ADDRESS);
+    if (!matched) {
+      Serial.printf("[%s] Modbus 0x%02X response mismatch (job %lu)\n", targetMac, writeFunction,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+    BmsModbusControl::setState(command.id,
+                               BmsModbusControl::CommandState::Acknowledged);
+
+    if (!command.verifyResult) continue;
+
+    delay(500);
+    uint8_t readRequest[BmsModbusControl::FRAME_LENGTH];
+    const bool isMosfet = command.reg == 0x0121 || command.reg == 0x0122;
+    const uint16_t readReg = isMosfet ? 0x0052 : command.reg;
+    const uint8_t readCount = (isMosfet || isCapacity) ? 2 : 1;
+    const size_t expectedReadLength = 5 + readCount * 2;
+    BmsModbusControl::buildReadHoldingRegisters(
+      DALY_MODBUS_BLE_REQUEST_ADDRESS, readReg, readCount, readRequest);
+    clearNotifyBuffer();
+    logModbusFrame(targetMac, "->", readRequest, sizeof(readRequest));
+    if (!writeCharacteristic->writeValue(readRequest, sizeof(readRequest),
+                                         writeCharacteristic->canWrite())) {
+      Serial.printf("[%s] Modbus readback BLE write failed (job %lu)\n", targetMac,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+    if (!waitModbusResponse(0x03, expectedReadLength, 1500, response,
+                            responseLength)) {
+      Serial.printf("[%s] Modbus readback timeout (job %lu)\n", targetMac,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+    logModbusFrame(targetMac, "<-", response, responseLength);
+        uint16_t readValues[2] = {};
+        if (!BmsModbusControl::parseReadHoldingResponse(
+          response, responseLength, DALY_MODBUS_BLE_RESPONSE_ADDRESS,
+          readCount, readValues)) {
+      Serial.printf("[%s] Modbus readback frame invalid (job %lu)\n", targetMac,
+                    static_cast<unsigned long>(command.id));
+      BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
+      continue;
+    }
+
+    const uint32_t actualValue = isCapacity
+      ? (static_cast<uint32_t>(readValues[0]) << 16) | readValues[1]
+      : readValues[command.reg == 0x0122 ? 1 : 0];
+    const BmsModbusControl::CommandState state = actualValue == command.value
+        ? BmsModbusControl::CommandState::Verified
+        : BmsModbusControl::CommandState::Mismatch;
+    BmsModbusControl::setState(command.id, state, true, actualValue);
+    if (VERBOSE) {
+      Serial.printf("[%s] Modbus readback reg %04X requested %lu actual %lu (%s)\n",
+            targetMac, command.reg, static_cast<unsigned long>(command.value),
+            static_cast<unsigned long>(actualValue),
+                    BmsModbusControl::stateName(state));
+    }
+  }
 }
 
 static void dumpGatt(NimBLEClient* client) {
@@ -208,6 +387,7 @@ bool pollOne(Bms& bms) {
         Serial.printf("  cells: got %d/%d frames\n", parser.cellFrameCount(), neededFrames);
       }
 
+      processQueuedModbusWrites(bms.dev.mac.c_str(), writeCharacteristic);
       good = parser.hasCommand(0x90);
     }
   }

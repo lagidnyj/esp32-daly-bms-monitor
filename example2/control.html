@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>BMS Control</title>
+<link rel="stylesheet" href="bms.css">
+<style>
+.toolbar,.actions,.inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.toolbar{justify-content:space-between}
+.toolbar a{color:var(--mut);font-size:13px}
+.notice{border:1px solid #73551e;background:#211a0d;color:#f5ca75;border-radius:10px;padding:12px 14px}
+.notice strong{display:block;margin-bottom:4px}
+.grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr))}
+.field{display:flex;flex-direction:column;gap:5px;margin:10px 0}
+.field label,.muted{color:var(--mut);font-size:12px}
+input,select,button{font:inherit;color:var(--txt);background:#0a1016;border:1px solid var(--line);border-radius:8px;padding:9px 10px}
+input,select{width:100%;min-width:0}
+button{cursor:pointer}
+button:hover:not(:disabled){border-color:var(--c-v)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.actions button{flex:1}
+.address{color:var(--c-v);font-variant-numeric:tabular-nums}
+.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}
+.status-value{font-size:18px;font-weight:650}
+.status-line{min-height:1.5em;color:var(--mut);font-size:12px}
+.log{min-height:90px;max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#080c11;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+.check{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px}
+.check input{width:auto}
+</style>
+</head>
+<body>
+<main>
+  <header class="toolbar">
+    <h1 class="title">Керування BMS</h1>
+    <nav class="inline"><a href="/">Монітор</a><a href="/fs">Файли</a></nav>
+  </header>
+
+  <section class="card">
+    <div class="head"><div class="title">Вибір BMS</div></div>
+    <div class="grid">
+      <div class="field">
+        <label for="device">MAC цільової BMS для Modbus-команди</label>
+        <input id="device" autocomplete="off" placeholder="Наприклад, 02:11:22:33:44:55">
+      </div>
+    </div>
+    <div class="inline">
+      <button id="readStatus" type="button">Оновити стан з /data</button>
+      <span id="statusLine" class="status-line" role="status">Стан ще не зчитано.</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="head"><div class="title">Експериментальне Modbus-керування</div><span class="tag">запит 0x81 / відповідь 0x51</span></div>
+    <p class="muted">Перевірка перечитує стан MOSFET або записаний параметр.</p>
+    <p class="muted">Перед тестом увійдіть у `/update` з OTA-обліковими даними. Запити й Basic Auth передаються незашифрованим HTTP; використовуйте лише довірену мережу.</p>
+    <label class="check"><input id="verifyWriteResult" type="checkbox" checked> Перевірити результат після запису</label>
+    <div class="grid">
+      <article>
+        <div class="head"><div class="title">Charge MOS <span class="address">0x0121</span></div></div>
+        <div class="actions">
+          <button type="button" data-modbus-register="0x0121" data-modbus-value="1">Увімкнути</button>
+          <button type="button" data-modbus-register="0x0121" data-modbus-value="0">Вимкнути</button>
+        </div>
+      </article>
+      <article>
+        <div class="head"><div class="title">Discharge MOS <span class="address">0x0122</span></div></div>
+        <div class="actions">
+          <button type="button" data-modbus-register="0x0122" data-modbus-value="1">Увімкнути</button>
+          <button type="button" data-modbus-register="0x0122" data-modbus-value="0">Вимкнути</button>
+        </div>
+      </article>
+    </div>
+    <div class="field">
+      <label for="modbusSocValue">SOC, % (0–100; точність 0,1%) <span class="address">0x0116</span></label>
+      <input id="modbusSocValue" type="number" min="0" max="100" step="0.1" inputmode="decimal" placeholder="Наприклад, 99.0">
+    </div>
+    <button type="button" data-modbus-register="0x0116">Записати SOC</button>
+    <div class="field">
+      <label for="modbusRatedCapacity">Номінальна ємність, А·год <span class="address">0x0109</span></label>
+      <input id="modbusRatedCapacity" type="number" min="0.001" max="4294967.295" step="0.001" inputmode="decimal" placeholder="Наприклад, 190">
+    </div>
+    <button type="button" data-modbus-register="0x0109">Записати номінальну ємність</button>
+    <div class="field">
+      <label for="modbusSleepTime">Час сну, с (10–65520; крок 10) <span class="address">0x0115</span></label>
+      <input id="modbusSleepTime" type="number" min="10" max="65520" step="10" inputmode="numeric" placeholder="Наприклад, 36000">
+    </div>
+    <button type="button" data-modbus-register="0x0115">Записати час сну</button>
+    <p id="modbusStatus" class="status-line" role="status">Записи вимкнені за замовчуванням; потрібні прапорець експерименту та налаштований OTA-пароль.</p>
+  </section>
+
+  <section class="card">
+    <div class="head"><div class="title">Стан BMS з /data</div></div>
+    <div class="status-grid">
+      <div><div class="lbl">CHG (з /data)</div><div id="chargeStatus" class="status-value">—</div></div>
+      <div><div class="lbl">DSG (з /data)</div><div id="dischargeStatus" class="status-value">—</div></div>
+      <div><div class="lbl">SOC (з /data)</div><div id="socStatus" class="status-value">—</div></div>
+      <div><div class="lbl">З’єднання</div><div id="onlineStatus" class="status-value">—</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="head"><div class="title">Журнал</div></div>
+    <div class="field">
+      <label for="log">Команди та читання телеметрії</label>
+      <pre id="log" class="log" aria-live="polite">Готово.</pre>
+    </div>
+    <button id="clearLog" type="button">Очистити журнал</button>
+  </section>
+</main>
+
+<script>
+const $ = selector => document.querySelector(selector);
+const log = $('#log');
+
+function addLog(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  log.textContent = `[${timestamp}] ${message}\n${log.textContent}`;
+}
+
+function getDevices(data) {
+  if (Array.isArray(data)) return data.map((device, index) => [String(index), device]);
+  if (data && Array.isArray(data.devices)) {
+    return data.devices.map((device, index) => [String(index), device]);
+  }
+  if (data && typeof data === 'object') return Object.entries(data);
+  return [];
+}
+
+function findDevice(entries, query) {
+  if (!query) return entries[0]?.[1] ?? null;
+  const needle = query.toLowerCase();
+  const match = entries.find(([key, device]) =>
+    [key, device?.mac, device?.id, device?.name].some(value =>
+      typeof value === 'string' && value.toLowerCase() === needle));
+  return match?.[1] ?? null;
+}
+
+function showValue(value) {
+  if (value === true) return 'ON';
+  if (value === false) return 'OFF';
+  return value == null ? '—' : String(value);
+}
+
+async function readStatus() {
+  $('#statusLine').textContent = 'Зчитую /data…';
+  try {
+    const response = await fetch('/data', {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const entries = getDevices(await response.json());
+    const device = findDevice(entries, $('#device').value.trim());
+    if (!device) throw new Error('BMS не знайдена у відповіді /data');
+
+    $('#chargeStatus').textContent = showValue(device.charge);
+    $('#dischargeStatus').textContent = showValue(device.discharge);
+    $('#socStatus').textContent = device.percent_remain == null
+      ? '—'
+      : `${device.percent_remain}%`;
+    $('#onlineStatus').textContent = showValue(device.connected);
+    $('#statusLine').textContent = 'Стан оновлено з /data.';
+    addLog('Отримано поточні поля charge, discharge, percent_remain, connected з /data.');
+  } catch (error) {
+    $('#statusLine').textContent = `Не вдалося зчитати стан: ${error.message}`;
+    addLog(`Помилка читання /data: ${error.message}`);
+  }
+}
+
+async function waitForModbusCommand(commandId) {
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    const response = await fetch(`/api/control/status?id=${encodeURIComponent(commandId)}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) throw new Error(`Статус команди: HTTP ${response.status}`);
+    const result = await response.json();
+    if (['acknowledged', 'verified', 'mismatch', 'failed'].includes(result.state)) return result;
+    await new Promise(resolve => setTimeout(resolve, 750));
+  }
+  throw new Error('Час очікування результату команди вичерпано. Перевірте зв’язок і стан черги.');
+}
+
+async function submitModbusCommand(button) {
+  const mac = $('#device').value.trim();
+  const register = Number(button.dataset.modbusRegister);
+  const isSoc = register === 0x0116;
+  const isCapacity = register === 0x0109;
+  const isSleep = register === 0x0115;
+  let value = Number(button.dataset.modbusValue);
+  if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(mac)) {
+    throw new Error('Введіть повний MAC цільової BMS.');
+  }
+  let confirmation;
+  if (isSoc) {
+    const input = $('#modbusSocValue');
+    const soc = input.value === '' ? NaN : Number(input.value);
+    if (!Number.isFinite(soc) || soc < 0 || soc > 100 ||
+        Math.abs(soc * 10 - Math.round(soc * 10)) > 1e-8) {
+      throw new Error('Введіть SOC від 0 до 100% з точністю до 0,1%.');
+    }
+    value = Math.round(soc * 10);
+    confirmation = `Записати SOC ${soc.toFixed(1)}% на BMS ${mac}?`;
+  } else if (isCapacity) {
+    const input = $('#modbusRatedCapacity');
+    const capacity = input.value === '' ? NaN : Number(input.value);
+    const milliampHours = capacity * 1000;
+    if (!Number.isFinite(capacity) || capacity < 0.001 || capacity > 4294967.295 ||
+        Math.abs(milliampHours - Math.round(milliampHours)) > 1e-6) {
+      throw new Error('Введіть ємність від 0,001 до 4294967,295 А·год з точністю до 0,001 А·год.');
+    }
+    value = Math.round(milliampHours);
+    confirmation = `Записати номінальну ємність ${capacity} А·год на BMS ${mac}?`;
+  } else if (isSleep) {
+    const input = $('#modbusSleepTime');
+    const seconds = input.value === '' ? NaN : Number(input.value);
+    if (!Number.isInteger(seconds) || seconds < 10 || seconds > 65520 || seconds % 10 !== 0) {
+      throw new Error('Введіть час сну від 10 до 65520 секунд, кратний 10.');
+    }
+    value = seconds / 10;
+    confirmation = `Записати час сну ${seconds} с на BMS ${mac}?`;
+  } else {
+    const controlName = register === 0x0121 ? 'Charge MOS' : 'Discharge MOS';
+    const requestedState = value ? 'УВІМКНУТИ' : 'ВИМКНУТИ';
+    confirmation = `${requestedState} ${controlName} на BMS ${mac}?`;
+  }
+  if (!window.confirm(confirmation)) {
+    $('#modbusStatus').textContent = 'Команду скасовано.';
+    return;
+  }
+
+  const endpoint = isSoc ? '/api/control/soc'
+    : isCapacity ? '/api/control/rated-capacity'
+      : isSleep ? '/api/control/sleep' : '/api/control/mosfet';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      mac,
+      register,
+      value,
+      verify: $('#verifyWriteResult').checked
+    }),
+    signal: AbortSignal.timeout(10000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Команду відхилено: HTTP ${response.status}`);
+
+  $('#modbusStatus').textContent = `Команда ${body.id} у черзі для ${mac}. Очікую BLE-відповідь…`;
+  addLog(`Modbus ${isCapacity ? '0x10' : '0x06'} поставлено в чергу: ${mac}, reg 0x${register.toString(16).padStart(4, '0')}, value ${value}.`);
+  const result = await waitForModbusCommand(body.id);
+  const actual = result.actual == null ? '' : isSoc
+    ? `; зчитаний SOC ${(result.actual / 10).toFixed(1)}%`
+    : isCapacity ? `; зчитана ємність ${(result.actual / 1000).toFixed(3)} А·год`
+      : isSleep ? `; зчитаний час сну ${result.actual * 10} с`
+        : `; фактичний стан ${result.actual}`;
+  $('#modbusStatus').textContent = `Команда ${body.id}: ${result.state}${actual}.`;
+  addLog(`Результат команди ${body.id}: ${result.state}${actual}.`);
+}
+
+document.querySelectorAll('[data-modbus-register]').forEach(button => {
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    $('#modbusStatus').textContent = 'Надсилаю запит до черги…';
+    try {
+      await submitModbusCommand(button);
+    } catch (error) {
+      $('#modbusStatus').textContent = `Помилка: ${error.message}`;
+      addLog(`Modbus-команду не підтверджено: ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  });
+});
+
+$('#readStatus').addEventListener('click', readStatus);
+$('#clearLog').addEventListener('click', () => {
+  log.textContent = 'Журнал очищено.';
+});
+</script>
+</body>
+</html>
