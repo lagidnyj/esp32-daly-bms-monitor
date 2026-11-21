@@ -39,9 +39,9 @@ void DalyParser::parseFrame(const uint8_t* frame) {
   const uint8_t command = frame[2];
   const uint8_t* payload = frame + 4;
   if (VERBOSE) {
-    Serial.printf("  <- %02X:", command);
-    for (int i = 0; i < 13; i++) Serial.printf(" %02X", frame[i]);
-    Serial.println();
+    DEBUG_SERIAL.printf("  <- %02X:", command);
+    for (int i = 0; i < 13; i++) DEBUG_SERIAL.printf(" %02X", frame[i]);
+    DEBUG_SERIAL.println();
   }
 
   gotCmd_[command] = true;

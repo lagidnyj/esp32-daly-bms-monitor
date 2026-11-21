@@ -1,14 +1,36 @@
 # Example 2 modular sketch
 
-Install NimBLE-Arduino 2.x and ArduinoJson 6 in the Arduino environment used
-to build the sketch. The sketch requests a BLE MTU of 123. It connects without
+Install NimBLE-Arduino 2.x, ArduinoJson 6, and U8g2 in the Arduino environment
+used to build the sketch. Set `OLED_DISPLAY_ENABLED` in `BmsConfig.h` to `0`
+for boards without the display; in that mode U8g2 is not required. The sketch
+requests a BLE MTU of 123. It connects without
 automatic MTU exchange, then requests exchange separately and prints the
 current MTU after notification subscription. A rejected exchange does not
 abort polling.
 
+## HW-675 OLED
+
+This sketch has been compiled with both **ESP32C3 Dev Module** and
+**ESP32C3 Super Mini** board selections; **Dev Module is not required** for the
+HW-675. Choose the board profile that matches the physical board and build.
+For USB debug, set **USB CDC On Boot** to **Enabled** and leave
+`DEBUG_SERIAL_USB` set to `1` in `BmsConfig.h`; set it to `0` to use UART0
+instead. For other board profiles, verify the flash and USB options match the
+hardware.
+
+The HW-675 72x40 SSD1306 display is enabled by default. It uses I2C SDA on
+GPIO5, SCL on GPIO6, and address `0x3C`. The display rotates every two seconds
+through the Wi-Fi address (or Wi-Fi fault), the number of BMS targets, and the
+latest cloud result during normal operation. While the setup AP is active, it
+keeps the setup SSID, password, and IP address visible. The compact U8g2 4x6
+font keeps these details within the display width.
+Press the BOOT button on GPIO9 to turn the display off or back on. Holding BOOT
+while resetting or powering on may enter the ESP32 download mode.
+
 `VERBOSE` and `PRINT_JSON` are set to `1` in `BmsConfig.h` for protocol
 diagnostics: raw response frames (including `0x98`) and parsed telemetry JSON
-are printed to Serial at 115200 baud. Set either to `0` to reduce output.
+are printed to the selected debug port at 115200 baud. Set either to `0` to
+reduce output.
 JSON remains available at `/fdata` and is still sent to the cloud when cloud
 reporting is enabled.
 
@@ -23,15 +45,17 @@ be expanded for diagnostics.
 The sketch scans for new BMS devices at startup and every 15 minutes while
 there is room below `MAX_BMS`. Periodic scans happen after polling and may pause
 polling for the configured scan duration. Newly discovered devices are added
-without clearing telemetry for existing targets. Press `s` in Serial to trigger
-an immediate discovery scan. When `BMS_MACS` is explicitly configured, scans
-only refresh those configured targets; they do not add unlisted devices.
+without clearing telemetry for existing targets. Press `s` in the selected
+debug serial monitor to trigger an immediate discovery scan. When `BMS_MACS` is
+explicitly configured, scans only refresh those configured targets; they do not
+add unlisted devices.
 
 ## Wi-Fi and NTP
 
 On first boot, the device starts a protected setup access point when no Wi-Fi
-credentials are stored. Connect to the `Daly-BMS-<suffix>` network; its
-password and the setup URL are printed to Serial at 115200 baud. Open
+credentials are stored. Connect to the `Daly-BMS-<suffix>` network; its SSID,
+password, and IP address are shown on the OLED while setup is active and
+printed to the selected debug port at 115200 baud. Open
 `http://192.168.4.1/wifi` to configure the network. The setup page is also
 available at `http://<device-ip>/wifi` during normal operation, so credentials
 can be changed without a reset button. Saving credentials stores them in NVS
@@ -44,6 +68,38 @@ boot, a later network outage only triggers periodic reconnect attempts; it does
 not start the setup AP. If the device starts while the router is unavailable,
 it tries the saved network for 30 seconds before starting the setup AP. If the
 network returns while setup is active, the device reconnects and stops the AP.
+Reconnect attempts wait for the station to report a disconnection instead of
+restarting an in-progress connection. A stalled attempt is reset after 30
+seconds. The setup AP uses a visible 2.4 GHz channel 1 network.
+Wi-Fi transmit power is limited to 8.5 dBm for the current hardware test; this
+applies to both the router connection and setup AP.
+Reducing the transmit-power cap is a diagnostic to try when instability may be
+related to supply dips during radio transmission; it is not a general fix for
+incorrect credentials, router configuration, or weak signal. The cap limits
+radio output, not total board power consumption, and a lower value also reduces
+range.
+
+Common ESP32 Arduino power presets and approximate RF output are:
+`WIFI_POWER_MINUS_1dBm` (0.8 mW), `WIFI_POWER_2dBm` (1.6 mW),
+`WIFI_POWER_5dBm` (3.2 mW), `WIFI_POWER_7dBm` (5 mW),
+`WIFI_POWER_8_5dBm` (7 mW), `WIFI_POWER_11dBm` (13 mW),
+`WIFI_POWER_13dBm` (20 mW), `WIFI_POWER_15dBm` (32 mW),
+`WIFI_POWER_17dBm` (50 mW), `WIFI_POWER_18_5dBm` (71 mW),
+`WIFI_POWER_19dBm` (79 mW), and `WIFI_POWER_19_5dBm` (89 mW).
+Available presets depend on the Arduino-ESP32 core version and chip.
+
+In a sketch, set the cap after starting Wi-Fi:
+
+```cpp
+WiFi.begin(ssid, password);
+WiFi.setTxPower(WIFI_POWER_11dBm);
+```
+
+In this example, change `WIFI_POWER_8_5dBm` inside
+`configureWifiTxPower()` in `NetworkService.cpp`; that helper is called for
+both station and setup-AP startup. Test at a fixed distance, increasing in
+steps (for example 8.5, 11, then 13 dBm), and keep the lowest level that gives
+reliable connections and enough range.
 BLE polling continues without Wi-Fi. Once connected, the sketch synchronizes
 the clock from NTP.
 

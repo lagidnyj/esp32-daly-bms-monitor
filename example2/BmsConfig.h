@@ -35,8 +35,19 @@ static const char* const OTA_PASSWORD = "CHANGE_ME_OTA_PASSWORD";
 #define DALY_MODBUS_BLE_REQUEST_ADDRESS 0x81
 #define DALY_MODBUS_BLE_RESPONSE_ADDRESS 0x51
 #define ENABLE_EXPERIMENTAL_MODBUS_WRITES 0
+#define DEBUG_SERIAL_USB 1  // 1 = USB CDC, 0 = UART0
+#if defined(ARDUINO) && DEBUG_SERIAL_USB && \
+    (!defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT)
+#error "Enable USB CDC On Boot in the board options when DEBUG_SERIAL_USB is 1."
+#endif
+#if DEBUG_SERIAL_USB
+#define DEBUG_SERIAL Serial
+#else
+#define DEBUG_SERIAL Serial0
+#endif
 #define VERBOSE           1  // 1 = print raw BLE commands and response frames
-#define PRINT_JSON        1  // 1 = print telemetry JSON to Serial
+#define PRINT_JSON        1  // 1 = print telemetry JSON to DEBUG_SERIAL
+#define OLED_DISPLAY_ENABLED 1  // 1 = show status on the HW-675 72x40 OLED
 
 static const char* const SVC_UUID = "0000fff0-0000-1000-8000-00805f9b34fb";
 static const char* const NTF_UUID = "0000fff1-0000-1000-8000-00805f9b34fb";

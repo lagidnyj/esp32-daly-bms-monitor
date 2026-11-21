@@ -12,6 +12,7 @@
 namespace {
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 30000;
+constexpr uint32_t WIFI_ATTEMPT_TIMEOUT_MS = 30000;
 constexpr uint32_t AP_START_RETRY_INTERVAL_MS = 5000;
 constexpr uint32_t PROVISIONING_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 constexpr uint32_t RESTART_DELAY_MS = 1500;
@@ -29,7 +30,9 @@ Preferences preferences;
 StoredWifiCredentials storedCredentials = {};
 String wifiSsid;
 String wifiPassword;
-uint32_t lastWifiAttemptAt = 0;
+String apSsid;
+String apPassword;
+uint32_t wifiAttemptStartedAt = 0;
 uint32_t lastApStartAttemptAt = 0;
 uint32_t wifiConnectStartedAt = 0;
 uint32_t provisioningStartedAt = 0;
@@ -38,6 +41,9 @@ uint32_t ntpSyncStartedAt = 0;
 bool preferencesReady = false;
 bool provisioningActive = false;
 bool apStartAttempted = false;
+volatile bool wifiAttemptInProgress = false;
+volatile bool wifiRetryRequested = false;
+volatile uint32_t wifiRetryRequestedAt = 0;
 bool stationConnectedOnce = false;
 bool restartScheduled = false;
 bool ntpConfigured = false;
@@ -54,10 +60,32 @@ bool hasWifiCredentials() {
   return wifiSsid.length() > 0;
 }
 
+void handleWiFiEvent(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    wifiAttemptInProgress = false;
+    wifiRetryRequested = false;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifiAttemptInProgress = false;
+    wifiRetryRequestedAt = millis();
+    wifiRetryRequested = true;
+  }
+}
+
+void configureWifiTxPower() {
+  if (WiFi.setTxPower(WIFI_POWER_18_5dBm)) {
+    DEBUG_SERIAL.println("Wi-Fi TX power set to 18.5 dBm.");
+  } else {
+    DEBUG_SERIAL.println("Could not set Wi-Fi TX power to 18.5 dBm.");
+  }
+}
+
 void startWifiConnection() {
+  wifiAttemptInProgress = true;
+  wifiRetryRequested = false;
+  wifiAttemptStartedAt = millis();
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-  lastWifiAttemptAt = millis();
-  Serial.println("Connecting to Wi-Fi...");
+  configureWifiTxPower();
+  DEBUG_SERIAL.println("Connecting to Wi-Fi...");
 }
 
 void startProvisioningAP() {
@@ -69,31 +97,39 @@ void startProvisioningAP() {
   apStartAttempted = true;
   lastApStartAttemptAt = millis();
 
-  Serial.println("Starting Wi-Fi setup AP...");
+  DEBUG_SERIAL.println("Starting Wi-Fi setup AP...");
   const wifi_mode_t mode = hasWifiCredentials() ? WIFI_AP_STA : WIFI_AP;
   if (!WiFi.mode(mode)) {
-    Serial.println("Could not enable Wi-Fi AP mode; will retry.");
+    DEBUG_SERIAL.println("Could not enable Wi-Fi AP mode; will retry.");
     return;
   }
+  configureWifiTxPower();
   const uint32_t chipSuffix =
       static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFF);
   char suffix[7];
   snprintf(suffix, sizeof(suffix), "%06lX",
            static_cast<unsigned long>(chipSuffix));
-  const String apSsid = String("Daly-BMS-") + suffix;
-  const String apPassword = String("Bms-") + suffix;
-  Serial.printf("Starting setup network %s...\n", apSsid.c_str());
-  if (!WiFi.softAP(apSsid.c_str(), apPassword.c_str())) {
-    Serial.println("Could not start Wi-Fi setup access point; will retry.");
+  apSsid = String("Daly-BMS-") + suffix;
+  apPassword = String("Bms-") + suffix;
+  DEBUG_SERIAL.printf("Starting setup network %s...\n", apSsid.c_str());
+  if (!WiFi.softAP(apSsid.c_str(), apPassword.c_str(), 1, false, 4)) {
+    DEBUG_SERIAL.println("Could not start Wi-Fi setup access point; will retry.");
+    return;
+  }
+
+  const IPAddress apIp = WiFi.softAPIP();
+  if (apIp[0] == 0) {
+    DEBUG_SERIAL.println("Setup access point started without an IP address; will retry.");
+    WiFi.softAPdisconnect(true);
     return;
   }
 
   provisioningActive = true;
   provisioningStartedAt = millis();
-  Serial.printf("Wi-Fi setup AP: %s, password: %s, page: http://%s/wifi\n",
+  DEBUG_SERIAL.printf("Wi-Fi setup AP: %s, password: %s, page: http://%s/wifi\n",
                 apSsid.c_str(), apPassword.c_str(),
-                WiFi.softAPIP().toString().c_str());
-  Serial.printf("The setup AP will restart the device in %u seconds.\n",
+                apIp.toString().c_str());
+  DEBUG_SERIAL.printf("The setup AP will restart the device in %u seconds.\n",
                 static_cast<unsigned>(PROVISIONING_TIMEOUT_MS / 1000));
 }
 
@@ -109,9 +145,11 @@ bool isClockSynchronized() {
 
 namespace NetworkService {
 void begin() {
+  WiFi.onEvent(handleWiFiEvent);
+
   preferencesReady = preferences.begin(PREFERENCES_NAMESPACE, false);
   if (!preferencesReady) {
-    Serial.println("Could not open Wi-Fi credential storage.");
+    DEBUG_SERIAL.println("Could not open Wi-Fi credential storage.");
   } else {
     const size_t storedLength = preferences.getBytesLength(CREDENTIALS_KEY);
     if (storedLength == sizeof(storedCredentials)) {
@@ -125,10 +163,10 @@ void begin() {
         wifiSsid = storedCredentials.ssid;
         wifiPassword = storedCredentials.password;
       } else {
-        Serial.println("Stored Wi-Fi credentials are invalid; setup is required.");
+        DEBUG_SERIAL.println("Stored Wi-Fi credentials are invalid; setup is required.");
       }
     } else if (storedLength != 0) {
-      Serial.println("Stored Wi-Fi credentials are invalid; setup is required.");
+      DEBUG_SERIAL.println("Stored Wi-Fi credentials are invalid; setup is required.");
     }
   }
 
@@ -138,7 +176,7 @@ void begin() {
   }
 
   if (!hasWifiCredentials()) {
-    Serial.println("No Wi-Fi credentials are configured.");
+    DEBUG_SERIAL.println("No Wi-Fi credentials are configured.");
     startProvisioningAP();
     return;
   }
@@ -161,24 +199,26 @@ void loop() {
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_STA);
       provisioningActive = false;
-      Serial.println("Wi-Fi connected; setup access point stopped.");
+      apSsid = "";
+      apPassword = "";
+      DEBUG_SERIAL.println("Wi-Fi connected; setup access point stopped.");
     }
     if (!wifiConnectedReported) {
-      Serial.printf("Wi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
+      DEBUG_SERIAL.printf("Wi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
       wifiConnectedReported = true;
     }
     if (!ntpConfigured) {
       configTime(0, 0, "pool.ntp.org", "time.google.com");
       ntpSyncStartedAt = millis();
       ntpConfigured = true;
-      Serial.println("Synchronizing system clock with NTP...");
+      DEBUG_SERIAL.println("Synchronizing system clock with NTP...");
     }
     if (ntpConfigured && !ntpTimeoutReported && !isClockSynchronized() &&
         millis() - ntpSyncStartedAt >= NTP_SYNC_TIMEOUT_MS) {
-      Serial.println("NTP synchronization timed out; continuing without synchronized time.");
+      DEBUG_SERIAL.println("NTP synchronization timed out; continuing without synchronized time.");
       ntpTimeoutReported = true;
     } else if (isClockSynchronized() && !ntpTimeoutReported) {
-      Serial.println("System clock synchronized.");
+      DEBUG_SERIAL.println("System clock synchronized.");
       ntpTimeoutReported = true;
     }
     return;
@@ -189,15 +229,24 @@ void loop() {
     if (!provisioningActive) startProvisioningAP();
     if (provisioningActive &&
         millis() - provisioningStartedAt >= PROVISIONING_TIMEOUT_MS) {
-      Serial.println("Wi-Fi setup timed out; restarting device.");
+      DEBUG_SERIAL.println("Wi-Fi setup timed out; restarting device.");
       ESP.restart();
     }
     return;
   }
 
-  if (millis() - lastWifiAttemptAt >= WIFI_RETRY_INTERVAL_MS) {
-    Serial.println("Wi-Fi disconnected; retrying connection.");
+  if (wifiAttemptInProgress &&
+      millis() - wifiAttemptStartedAt >= WIFI_ATTEMPT_TIMEOUT_MS) {
+    DEBUG_SERIAL.println("Wi-Fi connection attempt timed out; resetting station.");
     WiFi.disconnect(false, false);
+    wifiAttemptInProgress = false;
+    wifiRetryRequestedAt = millis();
+    wifiRetryRequested = true;
+  }
+
+  if (wifiRetryRequested &&
+      millis() - wifiRetryRequestedAt >= WIFI_RETRY_INTERVAL_MS) {
+    DEBUG_SERIAL.println("Wi-Fi disconnected; retrying connection.");
     startWifiConnection();
   }
 
@@ -206,7 +255,7 @@ void loop() {
     startProvisioningAP();
     if (provisioningActive &&
         millis() - provisioningStartedAt >= PROVISIONING_TIMEOUT_MS) {
-      Serial.println("Wi-Fi setup timed out; restarting device.");
+      DEBUG_SERIAL.println("Wi-Fi setup timed out; restarting device.");
       ESP.restart();
     }
   }
@@ -214,6 +263,19 @@ void loop() {
 
 bool isProvisioning() {
   return provisioningActive;
+}
+
+const String& provisioningSsid() {
+  return apSsid;
+}
+
+const String& provisioningPassword() {
+  return apPassword;
+}
+
+bool isConnecting() {
+  return hasWifiCredentials() && !stationConnectedOnce && !provisioningActive &&
+         millis() - wifiConnectStartedAt < WIFI_CONNECT_TIMEOUT_MS;
 }
 
 bool saveWifiCredentials(const String& ssid, const String& password,

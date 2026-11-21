@@ -52,7 +52,7 @@ bool installDefaultFileIfMissing(const char* path, const char* content,
 
   File file = LittleFS.open(path, "w");
   if (!file) {
-    Serial.printf("Could not create default web file %s.\n", path);
+    DEBUG_SERIAL.printf("Could not create default web file %s.\n", path);
     return false;
   }
 
@@ -61,11 +61,11 @@ bool installDefaultFileIfMissing(const char* path, const char* content,
   file.close();
   if (written != size) {
     LittleFS.remove(path);
-    Serial.printf("Could not fully write default web file %s.\n", path);
+    DEBUG_SERIAL.printf("Could not fully write default web file %s.\n", path);
     return false;
   }
 
-  Serial.printf("Installed default web file %s (%u bytes).\n", path,
+  DEBUG_SERIAL.printf("Installed default web file %s (%u bytes).\n", path,
                 static_cast<unsigned>(size));
   return true;
 }
@@ -283,18 +283,18 @@ void handleOtaUpload() {
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
       otaUploadFailed = true;
       otaUploadError = "Could not start firmware update.";
-      Update.printError(Serial);
+      Update.printError(DEBUG_SERIAL);
       return;
     }
     otaUploadStarted = true;
-    Serial.printf("OTA upload started: %s\n", upload.filename.c_str());
+    DEBUG_SERIAL.printf("OTA upload started: %s\n", upload.filename.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (otaUploadStarted && !otaUploadFailed) {
       const size_t written = Update.write(upload.buf, upload.currentSize);
       if (written != upload.currentSize) {
         otaUploadFailed = true;
         otaUploadError = "Firmware write failed.";
-        Update.printError(Serial);
+        Update.printError(DEBUG_SERIAL);
         Update.abort();
       }
     }
@@ -302,12 +302,12 @@ void handleOtaUpload() {
     if (otaUploadStarted && !otaUploadFailed) {
       if (Update.end(true)) {
         otaUploadFinished = true;
-        Serial.printf("OTA upload completed: %u bytes.\n",
+        DEBUG_SERIAL.printf("OTA upload completed: %u bytes.\n",
                       static_cast<unsigned>(upload.totalSize));
       } else {
         otaUploadFailed = true;
         otaUploadError = "Firmware image validation or finalization failed.";
-        Update.printError(Serial);
+        Update.printError(DEBUG_SERIAL);
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -623,8 +623,8 @@ void begin() {
   server.on("/fs/upload", HTTP_POST, handleFileUploadComplete, handleFileUpload);
   server.onNotFound(handleStaticFile);
   server.begin();
-  Serial.println("LittleFS web files are served from /; telemetry JSON is available at /data and /fdata.");
-  Serial.println("LittleFS file manager available at /fs.");
+  DEBUG_SERIAL.println("LittleFS web files are served from /; telemetry JSON is available at /data and /fdata.");
+  DEBUG_SERIAL.println("LittleFS file manager available at /fs.");
 }
 
 void loop() {

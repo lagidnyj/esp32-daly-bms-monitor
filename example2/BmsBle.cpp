@@ -111,7 +111,7 @@ static bool sendCmd(NimBLERemoteCharacteristic* writeCharacteristic, uint8_t com
   for (int i = 0; i < 12; i++) sum += packet[i];
   packet[12] = sum;
   parser.clearCommand(command);
-  if (VERBOSE) Serial.printf("  -> %02X\n", command);
+  if (VERBOSE) DEBUG_SERIAL.printf("  -> %02X\n", command);
   return writeCharacteristic->writeValue(packet, 13, writeCharacteristic->canWrite());
 }
 
@@ -169,9 +169,9 @@ static bool waitModbusResponse(uint8_t function, size_t expectedLength,
 static void logModbusFrame(const char* targetMac, const char* direction,
                            const uint8_t* frame, size_t length) {
   if (!VERBOSE) return;
-  Serial.printf("[%s] Modbus %s", targetMac, direction);
-  for (size_t i = 0; i < length; i++) Serial.printf(" %02X", frame[i]);
-  Serial.println();
+  DEBUG_SERIAL.printf("[%s] Modbus %s", targetMac, direction);
+  for (size_t i = 0; i < length; i++) DEBUG_SERIAL.printf(" %02X", frame[i]);
+  DEBUG_SERIAL.println();
 }
 
 static void processQueuedModbusWrites(
@@ -198,7 +198,7 @@ static void processQueuedModbusWrites(
     clearNotifyBuffer();
     if (!writeCharacteristic->writeValue(request, requestLength,
                                          writeCharacteristic->canWrite())) {
-      Serial.printf("[%s] Modbus 0x%02X BLE write failed (job %lu)\n", targetMac, writeFunction,
+      DEBUG_SERIAL.printf("[%s] Modbus 0x%02X BLE write failed (job %lu)\n", targetMac, writeFunction,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
@@ -206,7 +206,7 @@ static void processQueuedModbusWrites(
 
     if (!waitModbusResponse(writeFunction, BmsModbusControl::FRAME_LENGTH, 1500, response,
                             responseLength)) {
-      Serial.printf("[%s] Modbus 0x%02X response timeout (job %lu)\n", targetMac, writeFunction,
+      DEBUG_SERIAL.printf("[%s] Modbus 0x%02X response timeout (job %lu)\n", targetMac, writeFunction,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
@@ -218,7 +218,7 @@ static void processQueuedModbusWrites(
         : BmsModbusControl::matchesWriteResponse(
               request, response, responseLength, DALY_MODBUS_BLE_RESPONSE_ADDRESS);
     if (!matched) {
-      Serial.printf("[%s] Modbus 0x%02X response mismatch (job %lu)\n", targetMac, writeFunction,
+      DEBUG_SERIAL.printf("[%s] Modbus 0x%02X response mismatch (job %lu)\n", targetMac, writeFunction,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
@@ -240,14 +240,14 @@ static void processQueuedModbusWrites(
     logModbusFrame(targetMac, "->", readRequest, sizeof(readRequest));
     if (!writeCharacteristic->writeValue(readRequest, sizeof(readRequest),
                                          writeCharacteristic->canWrite())) {
-      Serial.printf("[%s] Modbus readback BLE write failed (job %lu)\n", targetMac,
+      DEBUG_SERIAL.printf("[%s] Modbus readback BLE write failed (job %lu)\n", targetMac,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
     }
     if (!waitModbusResponse(0x03, expectedReadLength, 1500, response,
                             responseLength)) {
-      Serial.printf("[%s] Modbus readback timeout (job %lu)\n", targetMac,
+      DEBUG_SERIAL.printf("[%s] Modbus readback timeout (job %lu)\n", targetMac,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
@@ -257,7 +257,7 @@ static void processQueuedModbusWrites(
         if (!BmsModbusControl::parseReadHoldingResponse(
           response, responseLength, DALY_MODBUS_BLE_RESPONSE_ADDRESS,
           readCount, readValues)) {
-      Serial.printf("[%s] Modbus readback frame invalid (job %lu)\n", targetMac,
+      DEBUG_SERIAL.printf("[%s] Modbus readback frame invalid (job %lu)\n", targetMac,
                     static_cast<unsigned long>(command.id));
       BmsModbusControl::setState(command.id, BmsModbusControl::CommandState::Failed);
       continue;
@@ -271,7 +271,7 @@ static void processQueuedModbusWrites(
         : BmsModbusControl::CommandState::Mismatch;
     BmsModbusControl::setState(command.id, state, true, actualValue);
     if (VERBOSE) {
-      Serial.printf("[%s] Modbus readback reg %04X requested %lu actual %lu (%s)\n",
+      DEBUG_SERIAL.printf("[%s] Modbus readback reg %04X requested %lu actual %lu (%s)\n",
             targetMac, command.reg, static_cast<unsigned long>(command.value),
             static_cast<unsigned long>(actualValue),
                     BmsModbusControl::stateName(state));
@@ -281,9 +281,9 @@ static void processQueuedModbusWrites(
 
 static void dumpGatt(NimBLEClient* client) {
   for (auto* service : client->getServices(true)) {
-    Serial.printf("  svc %s\n", service->getUUID().toString().c_str());
+    DEBUG_SERIAL.printf("  svc %s\n", service->getUUID().toString().c_str());
     for (auto* characteristic : service->getCharacteristics(true)) {
-      Serial.printf("    chr %s%s%s%s%s\n", characteristic->getUUID().toString().c_str(),
+      DEBUG_SERIAL.printf("    chr %s%s%s%s%s\n", characteristic->getUUID().toString().c_str(),
                     characteristic->canRead() ? " R" : "", characteristic->canWrite() ? " W" : "",
                     characteristic->canWriteNoResponse() ? " Wn" : "",
                     characteristic->canNotify() ? " N" : "");
@@ -297,24 +297,24 @@ bool pollOne(Bms& bms) {
   bms.alertsValid = false;
   clearNotifyBuffer();
 
-  Serial.printf("[%s] connecting (%s, addrType %d)...\n", bms.dev.mac.c_str(),
+  DEBUG_SERIAL.printf("[%s] connecting (%s, addrType %d)...\n", bms.dev.mac.c_str(),
                 bms.dev.name.c_str(), (int)bms.dev.addr.getType());
-  Serial.printf("[%s] rssi at scan %d\n", bms.dev.mac.c_str(), bms.dev.rssi);
+  DEBUG_SERIAL.printf("[%s] rssi at scan %d\n", bms.dev.mac.c_str(), bms.dev.rssi);
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   if (scan->isScanning()) {
-    Serial.println("  [ble] stopping active scan before connect");
+    DEBUG_SERIAL.println("  [ble] stopping active scan before connect");
     scan->stop();
     for (int i = 0; i < 50 && scan->isScanning(); i++) delay(20);
   }
   if (scan->isScanning()) {
-    Serial.println("  [ble] scan is still active; skipping connect");
+    DEBUG_SERIAL.println("  [ble] scan is still active; skipping connect");
     return false;
   }
 
   NimBLEClient* client = NimBLEDevice::createClient();
   if (client == nullptr) {
-    Serial.println("  [ble] could not create client");
+    DEBUG_SERIAL.println("  [ble] could not create client");
     return false;
   }
   client->setConnectTimeout(CONNECT_MS);
@@ -324,55 +324,55 @@ bool pollOne(Bms& bms) {
   const bool connected = client->connect(bms.dev.addr, true, false, false);
   if (!connected) {
     const int error = client->getLastError();
-    Serial.printf("[%s] CONNECT FAIL rc=%d (0x%X): %s  [%lu ms]\n", bms.dev.mac.c_str(),
+    DEBUG_SERIAL.printf("[%s] CONNECT FAIL rc=%d (0x%X): %s  [%lu ms]\n", bms.dev.mac.c_str(),
                   error, error, hint(error), (unsigned long)(millis() - connectStart));
     NimBLEDevice::deleteClient(client);
     return false;
   }
-  Serial.printf("[%s] connected in %lu ms\n", bms.dev.mac.c_str(),
+  DEBUG_SERIAL.printf("[%s] connected in %lu ms\n", bms.dev.mac.c_str(),
                 (unsigned long)(millis() - connectStart));
   if (!client->exchangeMTU()) {
     const int error = client->getLastError();
-    Serial.printf("[%s] MTU exchange request failed rc=%d; continuing at MTU %u\n",
+    DEBUG_SERIAL.printf("[%s] MTU exchange request failed rc=%d; continuing at MTU %u\n",
                   bms.dev.mac.c_str(), error, (unsigned)client->getMTU());
   } else {
-    Serial.printf("[%s] MTU exchange request sent\n", bms.dev.mac.c_str());
+    DEBUG_SERIAL.printf("[%s] MTU exchange request sent\n", bms.dev.mac.c_str());
   }
 
   bool good = false;
   NimBLERemoteService* service = client->getService(SVC_UUID);
   if (!service) {
-    Serial.println("  service FFF0 not found, GATT dump:");
+    DEBUG_SERIAL.println("  service FFF0 not found, GATT dump:");
     dumpGatt(client);
   } else {
     NimBLERemoteCharacteristic* notifyCharacteristic = service->getCharacteristic(NTF_UUID);
     NimBLERemoteCharacteristic* writeCharacteristic = service->getCharacteristic(WR_UUID);
     if (!notifyCharacteristic || !writeCharacteristic) {
-      Serial.println("  FFF1/FFF2 not found, GATT dump:");
+      DEBUG_SERIAL.println("  FFF1/FFF2 not found, GATT dump:");
       dumpGatt(client);
     } else if (!notifyCharacteristic->subscribe(true, onNotify)) {
-      Serial.println("  subscribe FAILED");
+      DEBUG_SERIAL.println("  subscribe FAILED");
     } else {
       delay(300);
-      Serial.printf("[%s] current MTU %u\n", bms.dev.mac.c_str(),
+      DEBUG_SERIAL.printf("[%s] current MTU %u\n", bms.dev.mac.c_str(),
                     (unsigned)client->getMTU());
       parser.resetResponses();
 
       static const uint8_t commands[] = {0x94, 0x90, 0x91, 0x92, 0x93, 0x98};
       for (uint8_t command : commands) {
         if (!sendCmd(writeCharacteristic, command)) {
-          Serial.printf("  write %02X FAILED\n", command);
+          DEBUG_SERIAL.printf("  write %02X FAILED\n", command);
         }
         const uint32_t timeoutMs = command == 0x98 ? 500 : 800;
-        if (!waitCmd(command, timeoutMs)) Serial.printf("  no reply to %02X\n", command);
+        if (!waitCmd(command, timeoutMs)) DEBUG_SERIAL.printf("  no reply to %02X\n", command);
         delay(80);
       }
       if (bms.alertsValid) {
-        Serial.printf("[%s] alerts 0x98:", bms.dev.mac.c_str());
-        for (uint8_t value : bms.alerts) Serial.printf(" %02X", value);
-        Serial.println();
+        DEBUG_SERIAL.printf("[%s] alerts 0x98:", bms.dev.mac.c_str());
+        for (uint8_t value : bms.alerts) DEBUG_SERIAL.printf(" %02X", value);
+        DEBUG_SERIAL.println();
       } else {
-        Serial.printf("[%s] alerts 0x98 unavailable\n", bms.dev.mac.c_str());
+        DEBUG_SERIAL.printf("[%s] alerts 0x98 unavailable\n", bms.dev.mac.c_str());
       }
 
       int neededFrames = ((bms.cells ? bms.cells : 16) + 2) / 3;
@@ -384,7 +384,7 @@ bool pollOne(Bms& bms) {
         delay(10);
       }
       if (parser.cellFrameCount() < neededFrames) {
-        Serial.printf("  cells: got %d/%d frames\n", parser.cellFrameCount(), neededFrames);
+        DEBUG_SERIAL.printf("  cells: got %d/%d frames\n", parser.cellFrameCount(), neededFrames);
       }
 
       processQueuedModbusWrites(bms.dev.mac.c_str(), writeCharacteristic);
@@ -399,7 +399,7 @@ bool pollOne(Bms& bms) {
   bms.ok = good;
   if (good) {
     bms.lastOk = millis();
-    Serial.printf("[%s] OK  %.1fV %.1fA SOC %.1f%%\n",
+    DEBUG_SERIAL.printf("[%s] OK  %.1fV %.1fA SOC %.1f%%\n",
                   bms.dev.mac.c_str(), bms.v, bms.a, bms.soc);
   }
   return good;
@@ -411,7 +411,7 @@ void doScan() {
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(99);
-  Serial.printf("[scan] %d ms...\n", SCAN_MS);
+  DEBUG_SERIAL.printf("[scan] %d ms...\n", SCAN_MS);
   NimBLEScanResults results = scan->getResults(SCAN_MS, false);
   for (int i = 0; i < (int)results.getCount(); i++) {
     const NimBLEAdvertisedDevice* device = results.getDevice(i);
@@ -420,13 +420,13 @@ void doScan() {
     Found found(device->getAddress(), mac,
                 device->haveName() ? device->getName() : std::string(), id, device->getRSSI(),
                 device->isAdvertisingService(NimBLEUUID(SVC_UUID)));
-    Serial.printf("  %s  rssi %4d  type %d  %-20s %s\n", found.mac.c_str(), found.rssi,
+    DEBUG_SERIAL.printf("  %s  rssi %4d  type %d  %-20s %s\n", found.mac.c_str(), found.rssi,
                   (int)device->getAddress().getType(), found.name.c_str(),
                   found.fff0 ? "[FFF0]" : "");
     seen.push_back(found);
   }
   scan->clearResults();
-  Serial.printf("[scan] %u devices\n", (unsigned)seen.size());
+  DEBUG_SERIAL.printf("[scan] %u devices\n", (unsigned)seen.size());
 }
 
 void buildTargets() {
@@ -449,7 +449,7 @@ void buildTargets() {
         }
       }
       if (!foundTarget) {
-        Serial.printf("[cfg] %s NOT seen in scan (busy with phone? out of range?) - trying anyway\n",
+        DEBUG_SERIAL.printf("[cfg] %s NOT seen in scan (busy with phone? out of range?) - trying anyway\n",
                       cfgMac.c_str());
         Found dev(NimBLEAddress(cfgMac, BLE_ADDR_PUBLIC), cfgMac, cfgName, cfgId, 0, false);
         bms.emplace_back(dev);
@@ -469,7 +469,7 @@ void buildTargets() {
       if (knownName || device.fff0) bms.emplace_back(device);
     }
   }
-  Serial.printf("[cfg] %u BMS target(s)\n", (unsigned)bms.size());
+  DEBUG_SERIAL.printf("[cfg] %u BMS target(s)\n", (unsigned)bms.size());
 }
 
 void scanAndUpdateTargets() {
@@ -506,7 +506,7 @@ void scanAndUpdateTargets() {
             bms.emplace_back(dev);
             ++added;
           } else {
-            Serial.printf("[cfg] target limit (%u) reached; ignoring %s\n",
+            DEBUG_SERIAL.printf("[cfg] target limit (%u) reached; ignoring %s\n",
                           static_cast<unsigned>(MAX_BMS), device.mac.c_str());
           }
         }
@@ -536,18 +536,18 @@ void scanAndUpdateTargets() {
       }
       if (alreadyTracked) continue;
       if (bms.size() >= MAX_BMS) {
-        Serial.printf("[cfg] target limit (%u) reached; ignoring %s\n",
+        DEBUG_SERIAL.printf("[cfg] target limit (%u) reached; ignoring %s\n",
                       static_cast<unsigned>(MAX_BMS), device.mac.c_str());
         continue;
       }
       bms.emplace_back(device);
       ++added;
-      Serial.printf("[cfg] discovered new BMS %s (%s)\n", device.mac.c_str(),
+      DEBUG_SERIAL.printf("[cfg] discovered new BMS %s (%s)\n", device.mac.c_str(),
                     device.name.c_str());
     }
   }
 
-  Serial.printf("[cfg] rescan complete: %u target(s), %u added, %u refreshed\n",
+  DEBUG_SERIAL.printf("[cfg] rescan complete: %u target(s), %u added, %u refreshed\n",
                 static_cast<unsigned>(bms.size()), static_cast<unsigned>(added),
                 static_cast<unsigned>(updated));
 }

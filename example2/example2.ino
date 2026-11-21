@@ -9,6 +9,7 @@
 #include "CloudReporter.h"
 #include "FileManager.h"
 #include "NetworkService.h"
+#include "OledDisplay.h"
 
 static uint32_t lastScanAt = 0;
 
@@ -19,7 +20,7 @@ static void rescanTargets() {
 
 static void pollAll() {
   std::vector<Bms>& bms = bmsDevices();
-  Serial.printf("\n=== poll cycle, heap %u ===\n", (unsigned)ESP.getFreeHeap());
+  DEBUG_SERIAL.printf("\n=== poll cycle, heap %u ===\n", (unsigned)ESP.getFreeHeap());
   int okCount = 0;
   for (auto& device : bms) {
     if (pollOne(device)) {
@@ -31,31 +32,33 @@ static void pollAll() {
     delay(1000);
     NetworkService::loop();
     FileManager::loop();
+    OledDisplay::loop(bms.size());
   }
   const String telemetryJson = buildJson(bms);
   FileManager::setTelemetryJson(telemetryJson);
-  if (PRINT_JSON) Serial.println(telemetryJson);
+  if (PRINT_JSON) DEBUG_SERIAL.println(telemetryJson);
   if (okCount > 0) CloudReporter::maybeSendUpdate(telemetryJson);
 
   static int failStreak = 0;
   failStreak = (okCount == 0) ? failStreak + 1 : 0;
   if (failStreak >= 2) {
-    Serial.println("[auto] nothing reachable twice in a row, rescanning");
+    DEBUG_SERIAL.println("[auto] nothing reachable twice in a row, rescanning");
     rescanTargets();
     failStreak = 0;
   }
 }
 
 void setup() {
-  Serial.begin(115200);
+  DEBUG_SERIAL.begin(115200);
   delay(1000);
-  Serial.println("\nDaly BLE poller, NimBLE-Arduino 2.x");
+  DEBUG_SERIAL.println("\nDaly BLE poller, NimBLE-Arduino 2.x");
   NetworkService::begin();
   CloudReporter::begin();
   FileManager::begin();
+  OledDisplay::begin();
   NimBLEDevice::init("esp32-daly");
   if (!NimBLEDevice::setMTU(BLE_MTU)) {
-    Serial.printf("Could not set local BLE MTU to %u.\n", (unsigned)BLE_MTU);
+    DEBUG_SERIAL.printf("Could not set local BLE MTU to %u.\n", (unsigned)BLE_MTU);
   }
   doScan();
   buildTargets();
@@ -65,9 +68,10 @@ void setup() {
 void loop() {
   NetworkService::loop();
   FileManager::loop();
+  OledDisplay::loop(bmsDevices().size());
   static uint32_t last = 0;
-  while (Serial.available()) {
-    char ch = Serial.read();
+  while (DEBUG_SERIAL.available()) {
+    char ch = DEBUG_SERIAL.read();
     if (ch == 's') {
       rescanTargets();
     }
@@ -77,7 +81,7 @@ void loop() {
   if (last == 0 || millis() - last >= POLL_INTERVAL_MS) {
     std::vector<Bms>& bms = bmsDevices();
     if (bms.empty()) {
-      Serial.println("[cfg] no targets found; waiting for next discovery scan");
+      DEBUG_SERIAL.println("[cfg] no targets found; waiting for next discovery scan");
     } else {
       pollAll();
     }
@@ -86,7 +90,7 @@ void loop() {
   }
   if (bmsDevices().size() < MAX_BMS &&
       millis() - lastScanAt >= RESCAN_INTERVAL_MS) {
-    Serial.println("[auto] periodic target discovery scan");
+    DEBUG_SERIAL.println("[auto] periodic target discovery scan");
     rescanTargets();
   }
   delay(20);
