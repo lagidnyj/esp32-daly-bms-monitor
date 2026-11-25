@@ -1,3 +1,6 @@
+# THIS THREAD IS OUTDATED AND NO LONGER RELEVANT
+# ЦЯ ГІЛКА ЗАСТАРІЛА ТА НЕ АКТУАЛЬНА
+
 # DALY firmware profile
 
 This is a read-only DALY A5 profile. It is a separate Arduino sketch so the
